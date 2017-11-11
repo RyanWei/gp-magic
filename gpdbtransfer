@@ -1,0 +1,1260 @@
+#!/usr/bin/perl
+use strict;
+use Switch;
+use MIME::Base64;
+use threads;
+use Thread::Queue;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use POSIX;
+
+my ($SRC_HOST,$SRC_PORT,$SRC_USER,$SRC_PASSWD,$SRC_DATABASE,$DEST_HOST,$DEST_PORT,$DEST_USER,$DEST_PASSWD,$DEST_DATABASE,
+    $KEY,$SRC_MAPFILE,$BY_LEAF,$FORCE,$FORCE_OWNER,@TABLE_ARRAY,@EX_TABLE_ARRAY,$TABLE_FILE,$EX_TABLE_FILE,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,
+    $NEED_DELETE,$NEED_TRUNCATE,$NEED_ANALYZE,$ENCODING,$BATCH_SIZE,$GLOBAL_CONDITION,$LOG_PATH,$PARAMETER_FILE,$IS_HELP);
+my (%SRC_HOSTMAP,$DEST_GPHOME,$TASK_QUEUE,$MSG_QUEUE,$LOG_FILE_HANDLE);
+my ($BATCH_MAX,$BATCH_DEFAULT,$BATCH_MIN) = (20,6,1);
+my ($KEY_DEFAULT) = (20140825);
+my ($SRC_SEG_SIZE,$DEST_SEG_SIZE);
+my ($LOG_PATH_DEFAULT) = ($ENV{"HOME"}."/gpAdminLogs");
+my (@TASK_THREAD,$MSG_THREAD,$LOCK_THREAD);
+my (@MESSAGE_CACHE);
+my ($WRITE_TO_FILE) = (0);
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+my $MAIN_PID = substr("000000".$$,-6);
+
+my $SQL_GET_ALL_USER_TABLE = q{select replace(encode(textsend(n.nspname),'base64'),chr(10),''),replace(encode(textsend(c.relname),'base64'),chr(10),'')
+    from pg_class c,pg_namespace n,gp_distribution_policy p
+    where c.relnamespace=n.oid and c.oid=p.localoid and (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%'
+    and c.relkind='r' and relstorage<>'x' and c.oid not in(select parchildrelid from pg_partition_rule);};
+my $SQL_GET_ALL_USER_LEAF = q{select replace(encode(textsend(n.nspname),'base64'),chr(10),''),replace(encode(textsend(c.relname),'base64'),chr(10),'')
+    from pg_class c,pg_namespace n,gp_distribution_policy p
+    where c.relnamespace=n.oid and c.oid=p.localoid and (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%'
+    and c.relkind='r' and relstorage<>'x' and not c.relhassubclass;};
+my $SQL_GET_ALL_USER_VIEW = q{with dep_all as(
+    select v.oid void,t.oid toid,t.relkind tkind,nt.nspname,t.relname
+    from pg_class v,pg_namespace nv,pg_depend dv,pg_class t,pg_namespace nt,pg_depend dt
+    where
+        v.oid = dv.refobjid and v.relnamespace = nv.oid
+        and dv.objid = dt.objid and dv.refobjid <> dt.refobjid
+        and t.oid = dt.refobjid and t.relnamespace = nt.oid
+        and v.relkind = 'v' and dv.refclassid = 1259
+        and dt.refclassid = 1259
+        and dv.deptype = 'i'
+        and (nv.oid > 16384 or nv.nspname = 'public')
+        and nv.nspname not like E'pg\_temp\_%'
+        group by 1,2,3,4,5
+),dep_multi as(
+    select void,nspname,relname from (
+        select * from dep_all d
+        union all
+        select d.void,d2.toid,d2.tkind,d2.nspname,d2.relname from dep_all d left join dep_all d2 on d.toid = d2.void and d.tkind='v'
+        union all
+        select d.void,d3.toid,d3.tkind,d3.nspname,d3.relname from dep_all d left join dep_all d2 on d.toid = d2.void and d.tkind='v' left join dep_all d3 on d2.toid = d3.void and d2.tkind='v'
+    ) x where tkind = 'r' group by 1,2,3
+),dep as(
+    select void,string_agg('"'||nspname||'"."'||relname||'"',',') deptables,count(*) nbr from dep_multi group by 1
+)
+select replace(encode(textsend(n.nspname),'base64'),chr(10),''),replace(encode(textsend(c.relname),'base64'),chr(10),''),
+    replace(encode(textsend(dep.deptables),'base64'),chr(10),'') from pg_class c
+    join pg_namespace n on c.relnamespace=n.oid
+    left join dep on c.oid = dep.void and dep.nbr <= 8
+    where (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%'
+    and c.relkind='v';};
+
+
+my $SQL_EXECUTE_FUNCTION_ARG_CHECK = q{select string_agg(t.typname,',' order by a.idx) from(
+    select proargtypes typs,generate_series(0,array_upper(proargtypes,1)) idx from pg_proc
+        where proname='gp_transfer_execute' and pronamespace=(select oid from pg_namespace where nspname='gp_toolkit')
+    )a,pg_type t where t.oid=a.typs[a.idx];};
+my $STR_EXECUTE_FUNCTION_ARG_CHECK = "varchar";
+my $SQL_EXECUTE_FUNCTION_BODY_CHECK = q{select md5(prosrc) from pg_proc
+    where proname='gp_transfer_execute' and pronamespace=(select oid from pg_namespace where nspname='gp_toolkit');};
+my $MD5_EXECUTE_FUNCTION_BODY_CHECK = "5c9dd8af64ef05f79f06df02e39f3cf2";
+my $SQL_EXECUTE_FUNCTION_DDL = q#create or replace function gp_toolkit.gp_transfer_execute(command varchar) returns text as $$
+import commands
+cmd_str=command
+try:
+    (cod,val)=commands.getstatusoutput(cmd_str)
+    if cod!=0:
+        plpy.error("%s:%s" % (cod,val))
+    else:
+        return val
+except Exception, e:
+    plpy.error(str(e))
+$$ language plpythonu;
+#;
+
+my $STR_SEG_PG_HBA = q^# "local" is for Unix domain socket connections only
+local   all     all                             trust
+# IPv4 local connections:
+host    all     all     127.0.0.1/24            trust
+host    all     all     0/0                     trust
+^;
+
+my $CMD_CLEVER_COMMAND = q^#!/bin/bash
+cd $(cd "$(dirname "$0")"; pwd)
+ARGS=$1
+ARGV=(${ARGS//./ })
+KEY=${ARGV[0]}
+USER=${ARGV[1]}
+INDX=${ARGV[2]}
+SIZE=${ARGV[3]}
+TYPE=${ARGV[4]}
+LPORT=${ARGV[5]}
+DBNM=${ARGV[6]}
+SCMA=${ARGV[7]}
+REL=${ARGV[8]}
+LOCK=${ARGV[9]}
+LOCK=`echo "$LOCK"|base64 -di`
+ENCD=${ARGV[10]}
+SEED=${ARGV[11]}
+WHERE=${ARGV[12]}
+WHERE=`echo "$WHERE"|base64 -di`
+. GPHOME_REPLACE/greenplum_path.sh >/dev/null 2>&1
+NMBR=`cat $KEY.info|wc -l`
+NMBR=$((NMBR-1))
+LCNTT=`PGOPTIONS='-c gp_session_role=utility' PGUSER=$USER psql -d template1 -p $LPORT -qtAXc "show gp_contentid"`
+LCNTT=$(((LCNTT+SEED)%SIZE))
+ps ax|grep -w 'psql'|grep -w "GPDBTRANSFER.$KEY.$INDX.$LPORT"|awk '{if($1!='$$'){system("kill -9 "$1)}}' >/dev/null 2>&1
+if [ "M" == "$TYPE" ];then
+RINFO=`cat $KEY.info|sed -n 1p`
+RARRAY=(${RINFO//,/ })
+RIP=${RARRAY[1]}
+RPORT=${RARRAY[2]}
+PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
+SET CLIENT_ENCODING TO $ENCD;
+$LOCK;
+COPY (SELECT * FROM "$SCMA"."$REL"$WHERE) TO STDOUT;
+EOF
+ERR=$?;if [ $ERR -ne 0 ];then exit $ERR;fi
+else
+while [ $LCNTT -lt $NMBR ];do
+LINE=$((LCNTT+2))
+RINFO=`cat $KEY.info|sed -n ${LINE}p`
+RARRAY=(${RINFO//,/ })
+RCNTT=${RARRAY[0]}
+RIP=${RARRAY[1]}
+RPORT=${RARRAY[2]}
+if ["TEST" == $WHERE ];then
+CCNTT=`PGOPTIONS='-c gp_session_role=utility' PGUSER=$USER psql -d postgres -h $RIP -p $RPORT $DBNM -qtAXc "show gp_contentid"`
+if [ $CCNTT != $RCNTT ];then
+exit 1
+fi
+fi
+PGOPTIONS='-c gp_session_role=utility' PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
+SET CLIENT_ENCODING TO $ENCD;
+$LOCK;
+COPY (SELECT * FROM "$SCMA"."$REL"$WHERE) TO STDOUT;
+EOF
+ERR=$?;if [ $ERR -ne 0 ];then exit $ERR;fi
+LCNTT=$((LCNTT+SIZE))
+done
+fi
+^;
+############################################################
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+Transfer data between Greenplum database use external table with transform on gpfdist.
+
+Developed by Miao Chen
+
+Work Email:
+michen\@pivotal.io
+Private Email:
+miaochen\@mail.ustc.edu.cn
+
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+$CMD_NAME --src-host hostname
+    [--src-port database port]
+    [--src-user database user]
+    [--src-passwd database password]
+    --src-database database name
+    --dest-host hostname
+    [--dest-port database port]
+    [--dest-user database user]
+    [--dest-passwd database password]
+    --dest-database database name
+    [--key identity number]
+    --src-mapfile filename
+    [--by-leaf]
+    [--force]
+    [--owner owner]
+    [-t <schema.relation> [-t <schema.relation>] ...]
+    [-T <schema.relation> [-T <schema.relation>] ...]
+    [-f file include table name]
+    [-F file include table name]
+    [-s <schema> [-s <schema>] ...]
+    [-S <schema> [-S <schema>] ...]
+    [--delete]
+    [--truncate]
+    [--analyze]
+    [--encoding encoding]
+    [-B batch_size]
+    [--where condition]
+    [--log-path directory]
+    [--parameter-file filename]
+    [-h|--help]
+*****************************************************
+DESCRIPTION
+*****************************************************
+The $CMD_NAME utility is used to transfer data in table or vew from source database to destination database(Greenplum Database).
+When you start $CMD_NAME, the utility will export from source database, the same time import to the destination database.
+
+$CMD_NAME is running in parallel.
+One table transfer is running at once on all Segment Host.
+At any time, there are several tables or views are transfer.
+
+Note:
+The source data can be table or view, but the destination can only be table.
+*****************************************************
+OPTIONS
+*****************************************************
+
+--src-host <source cluster master host>
+
+  Source database hostname or IP address.
+  This option is required.
+  eg.
+  --src-host src_master
+  --src-host 172.28.4.250
+
+--src-port <source cluster master port>
+
+  Source database port number, If not specified, the default is 5432.
+  eg.
+  --src-port 5433
+
+--src-user <source cluster user name>
+
+  User name that is used to connect to the source database. If not specified, the default is gpadmin.
+  eg.
+  --src-user src_user
+
+--src-passwd <source cluster user password>
+
+  User password that is used to connect to the source database.
+  If not specified, you should make source the connection is trusted.
+  eg.
+  --src-passwd password
+
+--src-database <database>
+
+  Source database.
+  This option is required.
+  If you not specify -t and -f options, all user tables in this database will be transfer.
+  eg.:
+  --src-database src_database
+
+--dest-host <destination cluster master host>
+
+  Destination database hostname or IP address.
+  This option is required.
+  eg.
+  --dest-host dest_master
+  --dest-host 172.28.4.250
+
+--dest-port <destination cluster master port>
+
+  Destination database port number, If not specified, the default is 5432.
+  eg.
+  --dest-port 5433
+
+--dest-user <destination cluster user name>
+
+  User name that is used to connect to the destination database. If not specified, the default is gpadmin.
+  eg.
+  --dest-user src_user
+
+--dest-passwd <destination cluster user password>
+
+  User password that is used to connect to the destination database.
+  If not specified, you should make source the connection is trusted.
+  eg.
+  --dest-passwd password
+
+--dest-database <database>
+
+  Destination database.
+  This option is required.
+  eg.:
+  --dest-database dest_database
+
+--key <identity number>
+
+  Identity number to lock resource between two cluster.
+  Default is $KEY_DEFAULT
+  eg.
+  --key 20140825
+
+--src-mapfile <source cluster segment hostname and ipaddress map file>
+
+  File that lists source segment host name and IP addresses.
+  This option is required.
+  If not all segment hosts are listed, $CMD_NAME may occur an error and quits.
+  Each line of the file contains a source segment address name and the IP address separated by a comma:
+  <hostname>,<IPaddress>
+  This example lists 4 hosts and their IP addresses.
+  sdw1-1,172.28.4.1
+  sdw1-2,172.28.8.1
+  sdw2-1,172.28.4.2
+  sdw2-2,172.28.8.2
+  sdw3-1,172.28.4.3
+  sdw3-2,172.28.8.3
+  sdw4-1,172.28.4.4
+  sdw4-2,172.28.8.4
+
+  You should specify all the map relationship about all segment host in source database table gp_segment_configuration:
+  select distinct address from gp_segment_configuration where content>-1
+  If you can ensure all the destination segments can identify all the source segments address,
+  you can specify an empty file, but don't recommend.
+
+--by-leaf
+
+  Transfer tables, which cannot be a parent table, must be leaf table.
+  In other word, tables must do not have children tables.
+
+--force
+
+  Specify this option to force recreate destination table and transfer, when table definition has difference.
+
+--owner
+
+  Specify this option to set owner -- when use --force option and recreate dest table when needed.
+
+-t <schema.tablename>
+
+  A table from the source database to transfer.
+  The fully qualified table name must be specified.
+  This option can be specified multiple times to include multiple tables.
+  If the source table does not exist, $CMD_NAME ignore it and log a notice message.
+
+  eg.
+  -t myschema.src_table
+
+-T <schema.relation>
+
+  Do not transfer this table.
+  This option can be specified multiple times to exclude multiple tables.
+  eg.:
+  -S public.ex_a -S public.ex_b
+
+-f <table-file>
+
+  The location and name of file containing list of fully qualified table names to copy from the source database.
+  In the text file, you should specify a single fully qualified table per line.
+  If the source table does not exist, $CMD_NAME ignore it and log a notice message.
+  In this file you can also specify views not only tables.
+  And, if you specify a view, you should specify the destination qualified table name as format:
+  src_schema.src_relation[=>dest_schema.dest_relation][;condition];
+  This example lists 4 tables or view should be transfer.
+  public.customer;time>='2016-01-01'
+  public.customer_v=>public.customer_branck;district_code='021'
+  myschema.orders
+  his.orders_his
+
+-F <table-file>
+
+  The location and name of file containing list of fully qualified table names to be exclude.
+  In the text file, you should specify a single fully qualified table per line.
+  If the table does not exist, $CMD_NAME ignore it.
+  You should specify the qualified table name as format:
+  schema.relation
+
+-s <schema name>
+
+  Transfer tables in this schema.
+  This option can be specified multiple times to include multiple schemas.
+  eg.:
+  -s public -s myschema
+
+-S <schema name>
+
+  Do not transfer tables in this schema.
+  This option can be specified multiple times to include multiple schemas.
+  eg.:
+  -S public -S myschema
+
+--delete
+
+  Specify this option to delete data from the table in the destination database.
+  The delete condition is specified by the same option --where.
+  If you not specify --where option, and you specify this parameter, the effect is the same as --truncate.
+
+--truncate
+
+  Specify this option to truncate the table in the destination database.
+
+--analyze
+
+  After load data, analyze the destination table to collect statistics information.
+
+--encoding <encoding>
+
+  Transfer data with this encoding, the default is UTF8.
+
+-B <batch_size>
+
+  Sets the maximum number of tables that $CMD_NAME concurrently copies to the destination database.
+  If not specified, the default is $BATCH_DEFAULT.
+  The max is $BATCH_MAX.
+  The min is $BATCH_MIN.
+
+--where <condition>
+
+  Specify this option to filter data from source table.
+
+--log-path <directory>
+
+  Specify the $CMD_NAME log file directory.
+  If not specified, the default is ~/gpAdminLogs.
+
+--parameter-file <parameter_file>
+
+  Specify the parameter file.
+  Format:
+  name=value
+  Like:
+  f=tranfer_table_list
+  src_database=postgres
+  ...
+
+-h|--help
+  Displays the online help.
+#;
+
+sub printMessage{
+    my ($flag,$message) = @_;
+    if("RAW" ne $flag){
+        my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime).$MAIN_PID;
+        $message = "$time_flag-[$flag]-:$message\n";
+    }
+    if("ERROR" eq $flag){
+        print STDERR $message;
+    }else{
+        print STDOUT $message;
+    }
+    return $message;
+}
+sub logMessage{
+    my ($flag,$message) = @_;
+    my $log_message = printMessage($flag,$message);
+    if($WRITE_TO_FILE == 1){
+        for my $msg(@MESSAGE_CACHE){
+            print $LOG_FILE_HANDLE $msg;
+        }
+        @MESSAGE_CACHE = ();
+        $WRITE_TO_FILE = 2;
+        print $LOG_FILE_HANDLE $log_message;
+    }elsif($WRITE_TO_FILE == 2){
+        print $LOG_FILE_HANDLE $log_message;
+    }else{
+        push @MESSAGE_CACHE,$log_message;
+    }
+}
+sub exitMain{
+    my ($code) = @_;
+    if("" ne $LOCK_THREAD){
+        $LOCK_THREAD->kill('KILL')->detach();
+    }
+    if(defined $LOG_FILE_HANDLE){
+        close($LOG_FILE_HANDLE);
+    }
+    exit $code;
+}
+sub errorMessage{
+    my ($message) = @_;
+    logMessage("ERROR",$message);
+    print STDERR "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exitMain(1);
+}
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+sub encode{
+    my ($string) = @_;
+    my $encode = encode_base64($string);
+    $encode =~ s/\n//g;
+    return $encode;
+}
+sub decode{
+    return decode_base64($_[0]);
+}
+sub illegal{
+    my @list = @_;
+    for my $str(@list){
+        if ($str =~ /[^\w\$]/){
+            return 1;
+        }
+    }
+    return 0;
+}
+sub escape{
+    my ($str) = @_;
+    $str =~ s/\r/\\r/g;
+    $str =~ s/\n/\\n/g;
+    $str =~ s/\t/\\t/g;
+    return $str;
+}
+sub readLineFromFile{
+    my ($file_path) = @_;
+    if(!-e $file_path){
+        errorMessage("No file exists named: $file_path");
+    }
+    if(!open(FILE,"<",$file_path)){
+        errorMessage("Can't open file: $file_path");
+    }
+    my @lines_array = ();
+    while(my $line = <FILE>){
+        $line = trim($line);
+        if(!($line =~ /^#/) && "" ne $line){
+            push @lines_array,$line;
+        }
+    }
+    close FILE;
+    return @lines_array;
+}
+sub queryResult{
+    my ($src_or_dest,$query_sql,$return_flag) = @_;
+    my $OPTS = "PGAPPNAME=gpdbtransfer ";
+    if("SRC" eq $src_or_dest){
+        $OPTS = $OPTS."PGHOST=$SRC_HOST PGDATABASE=$SRC_DATABASE PGPORT=$SRC_PORT ";
+        $OPTS = $OPTS.("" ne $SRC_USER ? "PGUSER=$SRC_USER " : "").("" ne $SRC_PASSWD ? "PGPASSWORD=$SRC_PASSWD " : "");
+    }elsif("DEST" eq $src_or_dest){
+        $OPTS = $OPTS."PGHOST=$DEST_HOST PGDATABASE=$DEST_DATABASE PGPORT=$DEST_PORT ";
+        $OPTS = $OPTS.("" ne $DEST_USER ? "PGUSER=$DEST_USER " : "").("" ne $DEST_PASSWD ? "PGPASSWORD=$DEST_PASSWD " : "");
+    }
+    my $query_result = readpipe($OPTS."psql -v ON_ERROR_STOP=1 -tAXF '#!^' 2>&1 <<'END_OF_SQL'\n".'\encoding UTF8;'."\n".$query_sql."\nEND_OF_SQL\n");
+    my $return_code = $? >> 8;
+    $query_result = trim($query_result);
+    if("CV" eq $return_flag){
+        return ($return_code,$query_result);
+    }
+    if($return_code){
+        errorMessage($query_result);
+    }elsif("Scalar" eq $return_flag){
+        return ($query_result);
+    }else{
+        my @rows_arry = split(/\n/,$query_result);
+        my @return_array = ();
+        for my $row(@rows_arry){
+            push @return_array,[split(/#\!\^/,$row)];
+        }
+        return @return_array;
+    }
+}
+sub getOption{
+    GetOptions(
+        'src-host:s'  => \$SRC_HOST,         'src-port:i'    => \$SRC_PORT,        'src-user:s'       => \$SRC_USER,       'src-passwd:s'  => \$SRC_PASSWD,  'src-database:s'  => \$SRC_DATABASE,
+        'dest-host:s' => \$DEST_HOST,        'dest-port:i'   => \$DEST_PORT,       'dest-user:s'      => \$DEST_USER,      'dest-passwd:s' => \$DEST_PASSWD, 'dest-database:s' => \$DEST_DATABASE,
+        'key:i'       => \$KEY,              'src-mapfile:s' => \$SRC_MAPFILE,     'by-leaf!'         => \$BY_LEAF,        'force!'        => \$FORCE,       'owner'           => \$FORCE_OWNER,
+        't:s'         => \@TABLE_ARRAY,      'T:s'           => \@EX_TABLE_ARRAY, 
+        'f:s'         => \$TABLE_FILE,       'F:s'           => \$EX_TABLE_FILE,
+        's:s'         => \@SCHEMA_ARRAY,     'S:s'           => \@EX_SCHEMA_ARRAY,
+        'delete!'     => \$NEED_DELETE,      'truncate!'     => \$NEED_TRUNCATE,   'analyze!'         => \$NEED_ANALYZE,   'encoding:s'    => \$ENCODING,    'B:i'             => \$BATCH_SIZE,
+        'where:s'     => \$GLOBAL_CONDITION, 'log-path:s'    => \$LOG_PATH,        'parameter-file:s' => \$PARAMETER_FILE, 'h|help!'       => \$IS_HELP,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exitMain(0);
+    }
+    if("" ne $PARAMETER_FILE){
+        my @parameter_array = readLineFromFile($PARAMETER_FILE);
+        for my $line(@parameter_array){
+            my ($para,$val) = split(/=/,$line,2);
+            ($para,$val) = (trim($para),trim($val));
+            if("src-host"      eq $para && "" eq $SRC_HOST         ){$SRC_HOST             =$val;}
+            if("src-port"      eq $para && "" eq $SRC_PORT         ){$SRC_PORT             =$val;}
+            if("src-user"      eq $para && "" eq $SRC_USER         ){$SRC_USER             =$val;}
+            if("src-passwd"    eq $para && "" eq $SRC_PASSWD       ){$SRC_PASSWD           =$val;}
+            if("src-database"  eq $para && "" eq $SRC_DATABASE     ){$SRC_DATABASE         =$val;}
+            if("dest-host"     eq $para && "" eq $DEST_HOST        ){$DEST_HOST            =$val;}
+            if("dest-port"     eq $para && "" eq $DEST_PORT        ){$DEST_PORT            =$val;}
+            if("dest-user"     eq $para && "" eq $DEST_USER        ){$DEST_USER            =$val;}
+            if("dest-passwd"   eq $para && "" eq $DEST_PASSWD      ){$DEST_PASSWD          =$val;}
+            if("dest-database" eq $para && "" eq $DEST_DATABASE    ){$DEST_DATABASE        =$val;}
+            if("key"           eq $para && "" eq $KEY              ){$KEY                  =$val;}
+            if("src-mapfile"   eq $para && "" eq $SRC_MAPFILE      ){$SRC_MAPFILE          =$val;}
+            if("by-leaf"       eq $para && "" eq $BY_LEAF          ){$BY_LEAF              =1   ;}
+            if("force"         eq $para && "" eq $FORCE            ){$FORCE                =1   ;}
+            if("owner"         eq $para && "" eq $FORCE_OWNER      ){$FORCE_OWNER          =$val;}
+            if("t"             eq $para                            ){push @TABLE_ARRAY     ,$val;}
+            if("T"             eq $para                            ){push @EX_TABLE_ARRAY  ,$val;}
+            if("f"             eq $para && "" eq $TABLE_FILE       ){$TABLE_FILE           =$val;}
+            if("F"             eq $para && "" eq $EX_TABLE_FILE    ){$EX_TABLE_FILE        =$val;}
+            if("s"             eq $para                            ){push @SCHEMA_ARRAY    ,$val;}
+            if("S"             eq $para                            ){push @EX_SCHEMA_ARRAY ,$val;}
+            if("delete"        eq $para && "" eq $NEED_DELETE      ){$NEED_DELETE          =1   ;}
+            if("truncate"      eq $para && "" eq $NEED_TRUNCATE    ){$NEED_TRUNCATE        =1   ;}
+            if("analyze"       eq $para && "" eq $NEED_ANALYZE     ){$NEED_ANALYZE         =1   ;}
+            if("encoding"      eq $para && "" eq $ENCODING         ){$ENCODING             =$val;}
+            if("B"             eq $para && "" eq $BATCH_SIZE       ){$BATCH_SIZE           =$val;}
+            if("where"         eq $para && "" eq $GLOBAL_CONDITION ){$GLOBAL_CONDITION     =$val;}
+            if("log-path"      eq $para && "" eq $LOG_PATH         ){$LOG_PATH             =$val;}
+        }
+    }
+}
+sub checkOption{
+    if("" eq $LOG_PATH){
+        $LOG_PATH = $LOG_PATH_DEFAULT;
+        logMessage("NOTICE","Log path not specify, Use default log path:$LOG_PATH");
+    }
+    system("mkdir -p $LOG_PATH");
+    my $log_file = $LOG_PATH."/gpdbtransfer_".(strftime("%Y%m%d",localtime)).".log";
+    if(!open($LOG_FILE_HANDLE,">>",$log_file)){
+        errorMessage("Can't open file:$log_file");
+    }else{
+        my $stdout = select $LOG_FILE_HANDLE;
+        $| = 1;
+        select $stdout;
+        logMessage("INFO","Log file:$log_file");
+    }
+    if("" eq $BATCH_SIZE || $BATCH_SIZE > $BATCH_MAX || $BATCH_SIZE < $BATCH_MIN){
+        logMessage("NOTICE","Not specify or out of limit, use default($BATCH_DEFAULT): -B");
+        $BATCH_SIZE = $BATCH_DEFAULT;
+    }
+    if("" eq $SRC_HOST){
+        errorMessage("Please specify parameter: --src-host");
+    }
+    if("" eq $SRC_PORT){
+        $SRC_PORT = "5432";
+    }
+    if("" eq $SRC_USER){
+        $SRC_USER = "gpadmin";
+    }
+    if("" eq $SRC_DATABASE){
+        errorMessage("Please specify parameter: --src-database");
+    }elsif(illegal($SRC_DATABASE)){
+        errorMessage("Source database name is not legal:[".escape($SRC_DATABASE)."]");
+    }
+    if("" eq $DEST_HOST){
+        errorMessage("Please specify parameter: --dest-host");
+    }
+    if("" eq $DEST_PORT){
+        $DEST_PORT = "5432";
+    }
+    if("" eq $DEST_USER){
+        $DEST_USER = "gpadmin";
+    }
+    if("" eq $DEST_DATABASE){
+        errorMessage("Please specify parameter: --dest-database");
+    }elsif(illegal($DEST_DATABASE)){
+        errorMessage("Dest database name is not legal:[".escape($DEST_DATABASE)."]");
+    }
+    if("" eq $SRC_MAPFILE){
+        errorMessage("Please specify parameter: --src-mapfile");
+    }
+    if("" eq $ENCODING){
+        $ENCODING = "UTF8";
+    }
+    if($SRC_PORT eq $DEST_PORT && $SRC_DATABASE eq $DEST_DATABASE && $SRC_HOST eq $DEST_HOST){
+        errorMessage("Can't transfer data in the same cluster and the same database");
+    }
+    if("" eq $KEY){
+        $KEY = $KEY_DEFAULT;
+    }
+    if($NEED_TRUNCATE && $NEED_DELETE){
+        errorMessage("Can't specify parameter at the same time --need-trunate with --need-delete");
+    }
+    $GLOBAL_CONDITION="" ne $GLOBAL_CONDITION ? " where ".$GLOBAL_CONDITION : "";
+    logMessage("INFO","Option values: --src-host $SRC_HOST --src-port $SRC_PORT --src-user $SRC_USER --src-passwd $SRC_PASSWD --src-database $SRC_DATABASE");
+    logMessage("INFO","Option values: --dest-host $DEST_HOST --dest-port $DEST_PORT --dest-user $DEST_USER --dest-passwd $DEST_PASSWD --dest-database $DEST_DATABASE");
+    logMessage("INFO","Option values: --key $KEY --src-mapfile $SRC_MAPFILE --by-leaf $BY_LEAF --force $FORCE --owner $FORCE_OWNER");
+    logMessage("INFO","Option values: -t ".join(' -t ',@TABLE_ARRAY)." -T ".join(' -T ',@EX_TABLE_ARRAY));
+    logMessage("INFO","Option values: -f $TABLE_FILE -F $EX_TABLE_FILE");
+    logMessage("INFO","Option values: -s ".join(' -s ',@SCHEMA_ARRAY)." -S ".join(' -S ',@EX_SCHEMA_ARRAY));
+    logMessage("INFO","Option values: --delete $NEED_DELETE --truncate $NEED_TRUNCATE --analyze $NEED_ANALYZE --encoding $ENCODING -B $BATCH_SIZE");
+    logMessage("INFO","Option values: --where $GLOBAL_CONDITION --log-path $LOG_PATH --parameter-file $PARAMETER_FILE");
+}
+sub checkSrcCluster{
+    logMessage("INFO","Check SRC plpythonu language");
+    my $str_lang = queryResult("SRC","select 1 from pg_language where lanname='plpythonu';","Scalar");
+    if("" eq $str_lang){
+        logMessage("INFO","SRC language plpythonu not exists, create it");
+        queryResult("SRC","Create language plpythonu;");
+    }else{
+        logMessage("INFO","SRC language plpythonu is OK");
+    }
+    logMessage("INFO","Check SRC function gp_toolkit.gp_transfer_execute");
+    my $str_exec = queryResult("SRC",$SQL_EXECUTE_FUNCTION_ARG_CHECK,"Scalar");
+    my $md5_exec = queryResult("SRC",$SQL_EXECUTE_FUNCTION_BODY_CHECK,"Scalar");
+    if($STR_EXECUTE_FUNCTION_ARG_CHECK ne $str_exec || $MD5_EXECUTE_FUNCTION_BODY_CHECK ne $md5_exec){
+        logMessage("INFO","SRC function gp_toolkit.gp_transfer_execute not exists or need upgrade");
+        queryResult("SRC","drop function if exists gp_toolkit.gp_transfer_execute($str_exec);");
+        queryResult("SRC",$SQL_EXECUTE_FUNCTION_DDL);
+    }else{
+        logMessage("INFO","SRC function gp_toolkit.gp_transfer_execute is OK");
+    }
+    my $mkdir_master_sql = qq{select gp_toolkit.gp_transfer_execute('mkdir -p /tmp/fifo');};
+    queryResult("SRC",$mkdir_master_sql,"Scalar");
+}
+sub checkSrcSegHba{
+    logMessage("INFO","Check SRC segment pg_hba.conf");
+    my $str_base64 = encode_base64($STR_SEG_PG_HBA);
+    my $str_md5 = trim(readpipe(qq{echo "$str_base64"|base64 -di|md5sum|cut -c 1-32}));
+    my $checkSql = qq{select distinct gp_toolkit.gp_transfer_execute('md5sum pg_hba.conf|cut -c 1-32') from gp_dist_random('gp_id');};
+    my @result = queryResult("SRC",$checkSql);
+    if(@result > 1 || $str_md5 ne $result[0][0]){
+        logMessage("INFO","SRC segment pg_hba.conf need open and reload");
+        my ($code,$value) = queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > pg_hba.conf') from gp_dist_random('gp_id');});
+        my ($code,$value) = queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('gpstop -u');});
+    }
+}
+sub checkDestCluster{
+    logMessage("INFO","Check DEST plpythonu language");
+    my $str_lang = queryResult("DEST","select 1 from pg_language where lanname='plpythonu';","Scalar");
+    if("" eq $str_lang){
+        logMessage("INFO","DEST language plpythonu not exists, create it");
+        queryResult("DEST","Create language plpythonu;");
+    }else{
+        logMessage("INFO","DEST language plpythonu is OK");
+    }
+    logMessage("INFO","Check DEST function gp_toolkit.gp_transfer_execute");
+    my $str_exec = queryResult("DEST",$SQL_EXECUTE_FUNCTION_ARG_CHECK,"Scalar");
+    my $md5_exec = queryResult("DEST",$SQL_EXECUTE_FUNCTION_BODY_CHECK,"Scalar");
+    if($STR_EXECUTE_FUNCTION_ARG_CHECK ne $str_exec || $MD5_EXECUTE_FUNCTION_BODY_CHECK ne $md5_exec){
+        logMessage("INFO","DEST function gp_toolkit.gp_transfer_execute not exists or need upgrade");
+        queryResult("DEST","drop function if exists gp_toolkit.gp_transfer_execute($str_exec);");
+        queryResult("DEST",$SQL_EXECUTE_FUNCTION_DDL);
+    }else{
+        logMessage("INFO","DEST function gp_toolkit.gp_transfer_execute is OK");
+    }
+    $DEST_GPHOME = queryResult("DEST",q{select gp_toolkit.gp_transfer_execute('echo $GPHOME')},"Scalar");
+    my $mkdir_master_sql = qq{select gp_toolkit.gp_transfer_execute('mkdir -p /tmp/fifo');};
+    queryResult("DEST",$mkdir_master_sql,"Scalar");
+    my $mkdir_segment_sql = qq{select gp_toolkit.gp_transfer_execute('mkdir -p /tmp/fifo') from gp_dist_random('gp_id');};
+    queryResult("DEST",$mkdir_segment_sql,"Scalar");
+}
+sub generateSrcHostMap{
+    if("" eq $SRC_MAPFILE){
+        errorMessage("Must specify parameter --src-mapfile");
+    }
+    if(!-e $SRC_MAPFILE){
+        errorMessage("File not exists named:$SRC_MAPFILE");
+    }
+    for my $line(readLineFromFile($SRC_MAPFILE)){
+        my ($hostname,$ip_address) = split(/,/,$line);
+        $SRC_HOSTMAP{lc(trim($hostname))} = trim($ip_address);
+    }
+}
+sub generateSrcClusterInfo{
+    logMessage("INFO","Generate source database hostname map relation-ship");
+    $SRC_SEG_SIZE = queryResult("SRC","select count(*) from gp_segment_configuration where status='u' and role='p' and content>-1;","Scalar");
+    $DEST_SEG_SIZE = queryResult("DEST","select count(*) from gp_segment_configuration where status='u' and role='p' and content>-1;","Scalar");
+    my @src_host_array = queryResult("SRC",qq{select content,address,port from gp_segment_configuration where status='u' and role='p' order by content;});
+    logMessage("INFO","SRC cluster size is: [$SRC_SEG_SIZE], DEST cluster size is: [$DEST_SEG_SIZE]");
+    my @srcClusterInfoArray = ();
+    my %hostname_hash = ();
+    for my $row(@src_host_array){
+        my ($content,$hostname,$port) = @$row;
+        my $ip_address = $hostname;
+        if(exists $SRC_HOSTMAP{$hostname}){
+            $ip_address = $SRC_HOSTMAP{$hostname};
+        }elsif(!exists $hostname_hash{$hostname}){
+            logMessage("NOTICE","Hostname [$hostname] not specify a ip address with --src-mapfile");
+            $hostname_hash{$hostname} = "";
+        }
+        push @srcClusterInfoArray,$content.','.$ip_address.','.$port;
+    }
+    my $srcClusterInfo = join("\n",@srcClusterInfoArray)."\n";
+    my $str_base64 = encode_base64($srcClusterInfo);
+    my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/$KEY.info') from gp_dist_random('gp_id');});
+}
+sub checkCleverCommand{
+    logMessage("INFO","Check DEST magic command file");
+    my $checkSql = qq{select distinct gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/gpdbtransfercat.sh ];then md5sum /tmp/fifo/gpdbtransfercat.sh|cut -c 1-32;fi') from gp_dist_random('gp_id');};
+    my @result = queryResult("DEST",$checkSql);
+    my $clever_command = $CMD_CLEVER_COMMAND;
+    $clever_command =~ s/GPHOME_REPLACE/$DEST_GPHOME/;
+    my $str_base64 = encode_base64($clever_command);
+    my $str_md5 = trim(readpipe(qq{echo "$str_base64"|base64 -di|md5sum|cut -c 1-32}));
+    if(@result > 1 || $str_md5 ne $result[0][0]){
+        logMessage("INFO","DEST magic command file [/tmp/fifo/gpdbtransfercat.sh] not exists or need upgrade");
+        my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/gpdbtransfercat.sh') from gp_dist_random('gp_id');});
+    }
+}
+sub getTableFromFile{
+    my ($file_path) = @_;
+    my @line_array;
+    if("" eq $file_path){
+        return @line_array;
+    }elsif(!-e $file_path){
+        errorMessage("File not exists named:$file_path");
+    }
+    for my $line(readLineFromFile($file_path)){
+        $line = trim($line);
+        if(!($line =~ /^#/) && "" ne $line){
+            my ($table_name,$where) = split(/;/,$line,2);
+            my ($src_table,$dest_table) = split(/=>/,$table_name);
+            push @line_array,[(trim($src_table),trim($dest_table),trim($where))];
+        }
+    }
+    return @line_array;
+}
+sub getAllUserTable{
+    my @user_table;
+    if($BY_LEAF){
+        @user_table = queryResult("SRC",$SQL_GET_ALL_USER_LEAF);
+    }else{
+        @user_table = queryResult("SRC",$SQL_GET_ALL_USER_TABLE);
+    }
+    my @return_array = ();
+    for my $row(@user_table){
+        my($scma,$rel) = @$row;
+        push @return_array,[(decode($scma),decode($rel))];
+    }
+    return @return_array;
+}
+sub getAllUserView{
+    my @user_view = queryResult("SRC",$SQL_GET_ALL_USER_VIEW);
+    my @return_array = ();
+    for my $row(@user_view){
+        my($scma,$rel,$dep_tables) = @$row;
+        push @return_array,[(decode($scma),decode($rel),decode($dep_tables))];
+    }
+    return @return_array;
+}
+sub processTableArray{
+    my @all_user_table_array = getAllUserTable();
+    my $all_user_table_size = @all_user_table_array;
+    logMessage("INFO","All table number in database is: [$all_user_table_size]");
+    my @all_user_view_array = getAllUserView();
+    my $all_user_view_size = @all_user_view_array;
+    logMessage("INFO","All view number in database is: [$all_user_view_size]");
+    #####################################################################################################
+    my %specify_table_hash = ();
+    for my $table(@TABLE_ARRAY){
+        my ($scma,$rel) = split(/\./,$table,2);
+        if(illegal($scma,$rel)){
+            logMessage("WARN","Table name specify is not legal:[$table]");
+            next;
+        }
+        $specify_table_hash{$table} = ([$table]);
+    }
+    for my $row(getTableFromFile($TABLE_FILE)){
+        my ($src_table,$dest_table,$where) = @$row;
+        if("" eq $dest_table){
+            $dest_table = $src_table;
+        }
+        my ($src_scma,$src_rel) = split(/\./,$src_table,2);
+        my ($dest_scma,$dest_rel) = split(/\./,$dest_table,2);
+        if(illegal($src_scma,$src_rel,$dest_scma,$dest_rel)){
+            logMessage("WARN","Table name in file is not legal:[$src_table => $dest_table]");
+            next;
+        }
+        $specify_table_hash{$src_table} = ([$dest_table,$where]);
+    }
+    #####################################################################################################
+    my %ex_table_hash = ();
+    for my $table(@EX_TABLE_ARRAY){
+        my ($scma,$rel) = split(/\./,$table,2);
+        if(illegal($scma,$rel)){
+            logMessage("WARN","Ex table name specify is not legal:[$table]");
+            next;
+        }
+        $ex_table_hash{$table} = "";
+    }
+    for my $row(getTableFromFile($EX_TABLE_FILE)){
+        my ($table) = @$row;
+        my ($scma,$rel) = split(/\./,$row,2);
+        if(illegal($scma,$rel)){
+            logMessage("WARN","Table name in file is not legal:[$table]");
+            next;
+        }
+        $ex_table_hash{$table} = ""
+    }
+    #####################################################################################################
+    my %specify_schema_hash = ();
+    for my $schema(@SCHEMA_ARRAY){
+        $specify_schema_hash{$schema} = "";
+    }
+    my %ex_schema_hash = ();
+    for my $schema(@EX_SCHEMA_ARRAY){
+        $ex_schema_hash{$schema} = "";
+    }
+    #####################################################################################################
+    my $check_specify = 0;
+    if(keys %specify_table_hash > 0 || keys %specify_schema_hash > 0 || "" ne $TABLE_FILE){
+        $check_specify = 1;
+        logMessage("INFO","Transfer relation from parameter or file in database: $SRC_DATABASE");
+    }else{
+        logMessage("INFO","Transfer all user table in database: $SRC_DATABASE");
+    }
+    #####################################################################################################
+    @TABLE_ARRAY = ();
+    for my $row(@all_user_table_array){
+        my ($scma,$rel) = @$row;
+        my $table = $scma.".".$rel;
+        if(illegal($scma,$rel)){
+            logMessage("FAILED","Table name is not legal:[".escape($table)."]");
+            next;
+        }
+        if(exists $ex_table_hash{$table} || exists $ex_schema_hash{$scma}){
+            next;
+        }
+        if($check_specify && (not exists $specify_table_hash{$table}) && (not exists $specify_schema_hash{$scma})){
+            next;
+        }
+        my ($dest_table,$where) = ($table,"");
+        if(exists $specify_table_hash{$table}){
+            ($dest_table,$where) = @{$specify_table_hash{$table}};
+        }
+        if("" eq $dest_table){
+            $dest_table = $table;
+        }
+        push @TABLE_ARRAY,[($table,$dest_table,$where,"r",qq{"$scma"."$rel"})];
+    }
+    if($check_specify){
+        for my $row(@all_user_view_array){
+            my($scma,$rel,$dep_tables) = @$row;
+            my $table = $scma.".".$rel;
+            if(illegal($scma,$rel)){
+                logMessage("FAILED","Table name is not legal:[".escape($table)."]");
+                next;
+            }
+            if(exists $ex_table_hash{$table} || exists $ex_schema_hash{$scma}){
+                next;
+            }
+            if(not exists $specify_table_hash{$table}){
+                next;
+            }
+            my ($dest_table,$where) = @{$specify_table_hash{$table}};
+            push @TABLE_ARRAY,[($table,$dest_table,$where,"v",$dep_tables)];
+        }
+    }
+}
+sub checkConflictProcess{
+    my $preSRC = queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/lockFrom.$KEY ];then cat /tmp/fifo/lockFrom.$KEY;else echo 0;fi');},"Scalar");
+    my $preDEST = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/lockTo.$KEY ];then cat /tmp/fifo/lockTo.$KEY;else echo 0;fi');},"Scalar");
+    if($preSRC !=0 || $preDEST != 0){
+        logMessage("WARNING","SRC or DEST exists lock file with the key: $KEY, wait a minute for check...");
+        for my $index(1 .. 60){
+            logMessage("RAW",".");sleep(1);if($index % 6 > 0){next;}
+            my $lastSRC = queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/lockFrom.$KEY ];then cat /tmp/fifo/lockFrom.$KEY;else echo 0;fi');},"Scalar");
+            my $lastDEST = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/lockTo.$KEY ];then cat /tmp/fifo/lockTo.$KEY;else echo 0;fi');},"Scalar");
+            if($preSRC != $lastSRC || $preDEST != $lastDEST){
+                logMessage("RAW","\n");
+                errorMessage("SRC or DEST is using the lock file with key: $KEY, you can try again later");
+            }
+        }
+        logMessage("RAW","\n");
+        logMessage("WARNING","Check timeout, the lock file may not be using, it will be reset");
+    }
+}
+sub checkTransferSchema{
+    my $dest_exists = queryResult("DEST","SELECT count(*) from pg_namespace where nspname='gpdbtransfer';","Scalar");
+    if(0 == $dest_exists){
+        logMessage("NOTICE","No schema named gpdbtransfer in destination database, create it.");
+        queryResult("DEST","create schema gpdbtransfer;","Scalar");
+    }
+}
+sub checkContentConsistent{
+    my $checkTable = 'gpdbtransfer.transform_'.$KEY.'_0';
+    queryResult("DEST","drop external table if exists $checkTable;","CV");
+    my $base64_lock = encode("--");
+    my $base64_where = encode("--");
+    my $checkSql = qq{drop external table if exists $checkTable;\n};
+    $checkSql = $checkSql."create external web table $checkTable(\n";
+    $checkSql = $checkSql."cntt int\n";
+    $checkSql = $checkSql.")execute E'sh /tmp/fifo/gpdbtransfercat.sh /tmp/fifo/gpdbtransfercat.sh $KEY.0.$DEST_SEG_SIZE.\$GP_SEG_PORT.$SRC_DATABASE.TEST.TEST.$base64_lock.$ENCODING.0.$base64_where'";
+    $checkSql = $checkSql." ON ALL FORMAT 'TEXT' ENCODING '$ENCODING';";
+    my ($code,$value) = queryResult("DEST",$checkSql,"CV");
+    queryResult("DEST","drop external table if exists $checkTable;","CV");
+    if($code > 0){
+        errorMessage("Some source hostname may not match address. Please specify a correct source mapfile with: --src-mapfile");
+    }
+}
+sub lockFileProcess{
+    $SIG{'KILL'} = sub{threads->exit;};
+    my $lockFlag = 1;
+    while(1){
+        $lockFlag += 1;
+        queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('echo $lockFlag > /tmp/fifo/lockFrom.$KEY');},"Scalar");
+        queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo $lockFlag > /tmp/fifo/lockTo.$KEY');},"Scalar");
+        sleep(30);
+    }
+}
+sub checkTableDefinition{
+    my ($src_column,$src_table,$dest_schema,$dest_relation) = @_;
+    my $dest_kind_sql = qq{select c.relkind from pg_namespace n,pg_class c  where c.relnamespace=n.oid and n.nspname='$dest_schema' and c.relname='$dest_relation';};
+    my ($code,$relkind) = queryResult("DEST",$dest_kind_sql,"CV");
+    if("" ne $relkind && "r" ne $relkind){
+        return "Dest relation $dest_schema.$dest_relation is not a table";
+    }
+    my $recreate_sql = "";
+    my $diff_column = "";
+    my @src_column_array = @$src_column;
+    my $src_column_size = @src_column_array;
+    if("r" eq $relkind){
+        my $dest_query_sql = qq{select attname,format_type(atttypid,atttypmod) from pg_namespace n,pg_class c,pg_attribute a where c.relnamespace=n.oid and c.oid=a.attrelid};
+        $dest_query_sql = $dest_query_sql.qq{ and c.relkind='r' and n.nspname='$dest_schema' and c.relname='$dest_relation' and a.attnum>0 and not a.attisdropped order by a.attnum;};
+        my @dest_column_array = queryResult("DEST",$dest_query_sql);
+        my $dest_column_size = @dest_column_array;
+        if($src_column_size eq $dest_column_size){
+            for my $idx(0 .. $src_column_size - 1){
+                my $src_column_type = $src_column_array[$idx]->[1];
+                my $dest_column_type = $dest_column_array[$idx]->[1];
+                if($src_column_type ne $dest_column_type){
+                    $diff_column = "column type ".($idx + 1)." SRC $src_column_type DEST $dest_column_type";
+                    last;
+                }
+            }
+        }else{
+            $diff_column = "column number SRC $src_column_size DEST $dest_column_size";
+        }
+    }
+    if("r" eq $relkind && "" eq $diff_column){
+        return "";
+    }elsif("r" eq $relkind && $FORCE){
+        $recreate_sql = $recreate_sql.qq{LOCK TABLE "$dest_schema"."$dest_relation" IN ACCESS EXCLUSIVE MODE NOWAIT;drop table if exists "$dest_schema"."$dest_relation" cascade;END;\n};
+        logMessage("NOTICE","Destination table not match the source $diff_column, force recreate it:[$dest_schema.$dest_relation]");
+    }elsif("" eq $relkind){
+        logMessage("NOTICE","Destination table not exists, create it:[$dest_schema.$dest_relation]");
+    }else{
+        return "FROM $src_table TO $dest_schema.$dest_relation has problem $diff_column";
+    }
+    if(("" ne $diff_column && $FORCE) || "" eq $relkind){
+        $recreate_sql = $recreate_sql.qq{create table "$dest_schema"."$dest_relation"(\n};
+        my $comment_sql = "\n";
+        for my $idx(0 .. $src_column_size - 1){
+            my ($column_name,$column_type,$relation_dsc,$column_dsc) = @{$src_column_array[$idx]};
+            $recreate_sql = $recreate_sql.'"'.$column_name.'"'."\t".$column_type;
+            $recreate_sql = $recreate_sql.($idx < $src_column_size-1 ? ",\n" : "\n");
+            if($idx == 0 && "" ne $relation_dsc){$comment_sql = $comment_sql.qq{comment on table "$dest_schema"."$dest_relation" is '$relation_dsc';\n};}
+            if("" ne $column_dsc){$comment_sql = $comment_sql.qq{comment on column "$dest_schema"."$dest_relation"."$column_name" is '$column_dsc';\n};}
+        }
+        $recreate_sql = $recreate_sql.")with(appendonly=true,compresstype=zlib,compresslevel=5)distributed randomly;";
+        if("" ne $FORCE_OWNER){
+            $recreate_sql = $recreate_sql.qq{ALTER TABLE "$dest_schema"."$dest_relation" OWNER TO $FORCE_OWNER;};
+        }
+        my ($code,$value) = queryResult("DEST",$recreate_sql.$comment_sql,"CV");
+        if($code){
+            return "Recreate destination table occur error:[$value]";
+        }else{
+            return "";
+        }
+    }
+}
+sub getSrcTableColumn{
+    my ($schema_name,$relation_name) = @_;
+    my $query_sql;
+    if($FORCE){
+        $query_sql = qq{select attname,format_type(atttypid,atttypmod),d1.description dsc1,d2.description dsc2 from
+        pg_namespace n join pg_class c on c.relnamespace=n.oid
+        join pg_attribute a on c.oid=a.attrelid
+        left join pg_description d1 on c.oid=d1.objoid and d1.objsubid=0
+        left join pg_description d2 on c.oid=d2.objoid and a.attnum=d2.objsubid
+        where  n.nspname='$schema_name' and c.relname='$relation_name'
+        and a.attnum>0 and not a.attisdropped order by a.attnum;};
+    }else{
+        $query_sql = qq{select attname,format_type(atttypid,atttypmod) from
+        pg_namespace n join pg_class c on c.relnamespace=n.oid
+        join pg_attribute a on c.oid=a.attrelid
+        where  n.nspname='$schema_name' and c.relname='$relation_name'
+        and a.attnum>0 and not a.attisdropped order by a.attnum;};
+    }
+    my @column_array = queryResult("SRC",$query_sql);
+    return (\@column_array);
+}
+sub executeTransfer{
+    my ($thread_index) = @_;
+    my $dest_ext_table = 'gpdbtransfer.transform_'.$KEY."_".$thread_index;
+    my $task = $TASK_QUEUE->dequeue();
+    my ($code,$value);
+    while(defined $task){
+        my @stat_msg :shared;
+        my ($src_table,$dest_table,$condition,$relkind,$dep_tables) = @$task;
+        $condition = "" eq $condition ? $GLOBAL_CONDITION : " where ".$condition;
+        my ($src_schema,$src_relation) = split(/\./,$src_table,2);
+        my $src_tableqq = qq{"$src_schema"."$src_relation"};
+        my ($dest_schema,$dest_relation) = split(/\./,$dest_table,2);
+        my $dest_tableqq = qq{"$dest_schema"."$dest_relation"};
+        my ($src_column) = getSrcTableColumn($src_schema,$src_relation);
+        my $problem = checkTableDefinition($src_column,$src_table,$dest_schema,$dest_relation);
+        if("" ne $problem){
+            @stat_msg = ("FAILED",$problem);
+        }else{
+            my $from_master = 0;
+            if("v" eq $relkind){
+                ($code,$value) = queryResult("SRC",qq{explain select * from $src_tableqq}.qq{$condition;},"CV");
+                if($code > 0){
+                   @stat_msg = ("FAILED","Can't get view's explain, FROM $src_table TO $dest_table [$code],[$value]");
+                   goto GOTO_NEXT_TASK;
+                }
+                if($value =~ /Gather Motion/){
+                    $value =~ s/Gather Motion/Ignore Check/;
+                    if($value =~ / Motion/){
+                        $from_master = 1;
+                    }
+                }else{
+                    $from_master = 1;
+                }
+            }
+            my $lock_sql = "--";
+            if("" ne $dep_tables){
+                $lock_sql = 'LOCK TABLE '.$dep_tables.' IN ACCESS SHARE MODE NOWAIT;';
+            }
+            my $base64_lock = encode($lock_sql);
+            my $base64_where = encode($condition);
+            srand;
+            my $random = ($SRC_SEG_SIZE eq $DEST_SEG_SIZE) ? 0 : int(rand(1*$SRC_SEG_SIZE*$DEST_SEG_SIZE));
+            my $dest_ext_ddl = "drop external table if exists $dest_ext_table;\n";
+            $dest_ext_ddl = $dest_ext_ddl."create external web table $dest_ext_table(\n";
+            $dest_ext_ddl = $dest_ext_ddl.qq{like $dest_tableqq};
+            $dest_ext_ddl = $dest_ext_ddl."\n)execute E'sh /tmp/fifo/gpdbtransfercat.sh $KEY.$SRC_USER.$thread_index.$DEST_SEG_SIZE";
+            $dest_ext_ddl = $dest_ext_ddl.($from_master ? ".M" : ".S");
+            $dest_ext_ddl = $dest_ext_ddl.".\$GP_SEG_PORT.$SRC_DATABASE.$src_schema.$src_relation.$base64_lock.$ENCODING.$random.$base64_where'";
+            if($from_master){
+                my $random_seg = int(rand($DEST_SEG_SIZE)) % $DEST_SEG_SIZE;
+                $dest_ext_ddl = $dest_ext_ddl." ON SEGMENT $random_seg";
+            }else{
+                $dest_ext_ddl = $dest_ext_ddl." ON ALL";
+            }
+            $dest_ext_ddl = $dest_ext_ddl."\nFORMAT 'TEXT' ENCODING '$ENCODING';";
+            ($code,$value) = queryResult("DEST",$dest_ext_ddl,"CV");
+            if($code > 0){
+                @stat_msg = ("FAILED","DDL occur error, FROM $src_table TO $dest_table [$code],[$value]");
+                goto GOTO_NEXT_TASK;
+            }
+            ($code,$value) = (0,"");
+            if($NEED_TRUNCATE || ($NEED_DELETE && "" eq $condition)){
+                ($code,$value) = queryResult("DEST",qq{BEGIN;LOCK TABLE $dest_tableqq IN ACCESS EXCLUSIVE MODE NOWAIT;truncate table $dest_tableqq;END;},"CV");
+            }elsif($NEED_DELETE){
+                ($code,$value) = queryResult("DEST",qq{BEGIN;LOCK TABLE $dest_tableqq IN EXCLUSIVE MODE NOWAIT;delete from $dest_tableqq}.$condition.";END;","CV");
+            }
+            if($code > 0){
+                @stat_msg = ("FAILED","Execute data clean occur error, FROM $src_table TO $dest_table [$code],[$value]");
+                goto GOTO_NEXT_TASK;
+            }
+            my @info_msg :shared = ("INFO","Start transfer FROM $src_table TO $dest_table TYPE $relkind MODE ".($from_master ? "LOW" : "FAST")." WITH $condition");
+            $MSG_QUEUE->enqueue(\@info_msg);
+            my $dest_sql = qq{set gp_autostats_mode to none;\nBEGIN;LOCK TABLE $dest_tableqq IN ROW EXCLUSIVE MODE NOWAIT;\ninsert into $dest_tableqq select * from $dest_ext_table;};
+            if($NEED_ANALYZE){
+                $dest_sql = $dest_sql.qq{\nanalyze $dest_tableqq(ctid);};
+            }
+            $dest_sql = $dest_sql."\nEND;";
+            my $start = time();
+            ($code,$value) = queryResult("DEST",$dest_sql,"CV");
+            my $duration = time() - $start;
+            if($code > 0){
+                my $app_name = qq{GPDBTRANSFER.$KEY.$thread_index};
+                my $clean_sql;
+                if($from_master){
+                    $clean_sql = qq{select pg_cancel_backend(procpid) from pg_stat_activity where application_name='$app_name';};
+                }else{
+                    $clean_sql = qq{select pg_cancel_backend(procpid) from (select (pg_stat_get_activity(NULL::integer)).* from gp_dist_random('gp_id')) t where application_name='$app_name';};
+                }
+                @stat_msg = ("FAILED","FROM $src_table TO $dest_table [$code],[$value]");
+                ($code,$value) = queryResult("SRC",$clean_sql,"CV");
+            }else{
+                for my $row(split(/\n/,$value)){if($row =~ /^INSERT/){$value = (split(/ /,$row))[2];}}
+                @stat_msg = ("SUCCESS"," $src_table TO $dest_table ROWS $value TYPE $relkind TIME $duration S WITH $condition");
+            }
+        }
+GOTO_NEXT_TASK:
+        $MSG_QUEUE->enqueue(\@stat_msg);
+        $task = $TASK_QUEUE->dequeue();
+    }
+    ($code,$value) = queryResult("DEST","drop external table if exists $dest_ext_table;","CV");
+    $MSG_QUEUE->enqueue(undef);
+}
+sub executeMessage{
+    my ($end_index,$error_index,$success_index) = (0,0,0);
+    my $tables_size = @TABLE_ARRAY;
+    my $msg = $MSG_QUEUE->dequeue();
+    while(1){
+        if(defined $msg){
+            my ($type,$msg) = @$msg;
+            if("SUCCESS" eq $type){
+                $success_index += 1;
+                logMessage($type,"($success_index/$error_index/$tables_size)".$msg);
+            }elsif("FAILED" eq $type){
+                $error_index += 1;
+                logMessage($type,"($success_index/$error_index/$tables_size)".$msg);
+            }else{
+                logMessage($type,$msg);
+            }
+        }else{
+            $end_index += 1;
+            if($end_index eq $BATCH_SIZE){
+                last;
+            }
+        }
+        $msg = $MSG_QUEUE->dequeue();
+    }
+    return $error_index;
+}
+sub startTransfer{
+    my $tables_size = @TABLE_ARRAY;
+    if(0 == $tables_size){
+        logMessage("INFO","No table will be transfer, exit");
+        return -1;
+    }else{
+        logMessage("INFO","Number of tables should be transfer is: $tables_size");
+    }
+    $TASK_QUEUE = Thread::Queue->new();
+    $MSG_QUEUE = Thread::Queue->new();
+    for my $table_scalar(@TABLE_ARRAY){
+        my @shared_array :shared = @$table_scalar;
+        $TASK_QUEUE->enqueue(\@shared_array);
+    }
+    for my $index(0 .. $BATCH_SIZE - 1){
+        $TASK_QUEUE->enqueue(undef);
+        my $task_thread = threads->new(\&executeTransfer,$index);
+        push @TASK_THREAD,$task_thread;
+    }
+    $MSG_THREAD = threads->new(\&executeMessage);
+    for my $thread(@TASK_THREAD){
+        $thread->join();
+    }
+    @TASK_THREAD = ();
+    my $value = $MSG_THREAD->join();
+    $MSG_THREAD = "";
+    return $value;
+}
+sub unlockFileProcess{
+    queryResult("SRC",qq{select gp_toolkit.gp_transfer_execute('rm /tmp/fifo/lockFrom.$KEY');},"CV");
+    queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('rm /tmp/fifo/lockTo.$KEY');},"CV");
+}
+sub main{
+    eval{threads->set_thread_exit_only(1);};
+    if($@){
+        errorMessage("Perl version is too old for multi threads.");
+    }
+    threads->set_thread_exit_only(1);
+    getOption();
+    logMessage("INFO","Start gpdbtransfer process".("." x 66));
+    logMessage("INFO","Run command: ".$_[0]);
+    checkOption();
+    $WRITE_TO_FILE = 1;
+    checkSrcCluster();
+    checkSrcSegHba();
+    checkDestCluster();
+    generateSrcHostMap();
+    generateSrcClusterInfo();
+    checkCleverCommand();
+    processTableArray();
+    checkConflictProcess();
+    checkTransferSchema();
+    checkContentConsistent();
+    $LOCK_THREAD = threads->new(\&lockFileProcess);
+    my $error_count = startTransfer();
+    unlockFileProcess();
+    if($error_count == -1){
+        logMessage("INFO","Finish transfer with no table be transfer......");
+        exitMain(11);
+    }elsif($error_count != 0){
+        logMessage("INFO","Finish transfer with failed......");
+        exitMain(33);
+    }else{
+        logMessage("INFO","Finish transfer with all success......");
+        exitMain(0);
+    }
+}
+my $command_string = $0." ".join(" ",@ARGV);
+$| = 1;
+main($command_string);
