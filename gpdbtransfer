@@ -1025,7 +1025,7 @@ sub processTableArray{
     }
     for my $row(getTableFromFile($EX_TABLE_FILE)){
         my ($table) = @$row;
-        my ($scma,$rel) = split(/\./,$row,2);
+        my ($scma,$rel) = split(/\./,$table,2);
         if(illegal($scma,$rel)){
             logMessage("WARN","Table name in file is not legal:[$table]");
             next;
