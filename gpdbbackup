@@ -32,8 +32,13 @@ my $RANDOM_TABLE_RECORD_CHECK_SQL = qq{select (select count(*) from gp_dist_rand
         where c.dbid=f.fsedbid and c.status='u' and c.role='p' and c.content>=0 and f.fsefsoid=(select oid from pg_filespace where fsname='pg_system')
     ) md left join gp_toolkit.gp_segment_config sc
     on md.content=sc.database_content and md.fselocation=sc.database_path and md.port=sc.database_port;};
-my $RANDOM_TABLE_RECORD_INSERT_SQL = qq{select c.content,f.fselocation,c.port,c.hostname from gp_segment_configuration c,pg_filespace_entry f
-    where c.dbid=f.fsedbid and c.status='u' and c.role='p' and c.content>=0 and f.fsefsoid=(select oid from pg_filespace where fsname='pg_system');};
+my $RANDOM_TABLE_RECORD_INSERT_SQL = q{drop external table if exists gp_toolkit.gp_segment_config_ext;
+create external web table gp_toolkit.gp_segment_config_ext(code text)
+execute 'C=`PGOPTIONS="-c gp_session_role=utility" PGPORT=$GP_SEG_PORT PGDATABASE=$GP_DATABASE psql -qtAXc "show gp_contentid"`;
+`PGOPTIONS="-c gp_session_role=utility" PGPORT=$GP_SEG_PORT PGDATABASE=$GP_DATABASE psql -qtAXc "insert into gp_toolkit.gp_segment_config select $C,''$GP_SEG_DATADIR'',$GP_SEG_PORT"`;'
+on all format 'text';
+select count(*) from gp_toolkit.gp_segment_config_ext;
+drop external table if exists gp_toolkit.gp_segment_config_ext;};
 
 my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
     select c.oid,nspname,relname,relstorage
@@ -397,8 +402,8 @@ OPTIONS
 
 --increment
 
-   Backup will identify whether an AO table need backup again.
-   From the last full backup to current, if found an AO table not change, will ignore it.
+   Backup will identify whether a table need backup again.
+   From the last full backup to current, if found a table not change, will ignore it.
 
 --residue <number of increment>
 
@@ -706,16 +711,11 @@ sub checkRandomTable{
     if($segment_number ne $all_number || $no_entry_number ne 0 || $wrong_number ne 0){
         logMessage("INFO","Racord in gp_toolkit.gp_segment_config incorrect, reinsert");
         queryResult("truncate table gp_toolkit.gp_segment_config;");
-        my @insert_result = queryResult($RANDOM_TABLE_RECORD_INSERT_SQL);
-        foreach my $insert_row(@insert_result){
-            my ($instance_content,$instance_directory,$instance_port,$instance_hostname) = @$insert_row;
-            my $OPTS = "PGOPTIONS='-c gp_session_role=utility' psql -tAX -d $DATABASE_NAME -h $instance_hostname -p $instance_port ";
-            my $insert_command = qq{$OPTS -c "insert into gp_toolkit.gp_segment_config values($instance_content,'$instance_directory',$instance_port)" >/dev/null};
-            my $value = system($insert_command);
-            my $code = $? >> 8;
-            if($code){
-                errorMessage("Error occur when insert recored into primary instance[$code][$value]");
-            }
+        queryResult($RANDOM_TABLE_RECORD_INSERT_SQL);
+        @check_record_result = queryResult($RANDOM_TABLE_RECORD_CHECK_SQL);
+        ($segment_number,$all_number,$no_entry_number,$wrong_number) = @{$check_record_result[0]};
+        if($segment_number ne $all_number || $no_entry_number ne 0 || $wrong_number ne 0){
+            errorMessage("Can not create right record in table table gp_toolkit.gp_segment_config");
         }
     }else{
         logMessage("INFO","Racord in gp_toolkit.gp_segment_config is OK");
@@ -825,7 +825,7 @@ sub getMergeCommand{
     my $alltable_size = @alltable_list;
     my $merge_size = @merge_cmd;
     logMessage("INFO","Merge data alltable size is: [$alltable_size] and merge size is: [$merge_size]");
-    my $merge_stat_file = "$MASTER_BACKUP_PATH$merge_date/$LAST_STAT_FILE_NAME.merge";
+    my $merge_stat_file = $MASTER_BACKUP_PATH.$merge_date."/".$LAST_STAT_FILE_NAME.".merge";
     system("touch ".$merge_stat_file);
     my $FILE_HANDLE;
     if(!open($FILE_HANDLE,">",$merge_stat_file)){
