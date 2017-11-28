@@ -13,3 +13,5 @@ gp数据库恢复命令，配合gpddbackup使用
 
 gpdbtransfer
 集群之间数据同步命令
+
+截止目前[20171128] 所有这些命令全部代码全部由 陈淼 [ miaochen@mail.ustc.edu.cn ] 个人贡献
