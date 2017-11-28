@@ -203,18 +203,20 @@ ARGS=$1
 ARGV=(${ARGS//./ })
 KEY=${ARGV[0]}
 USER=${ARGV[1]}
-INDX=${ARGV[2]}
-SIZE=${ARGV[3]}
-TYPE=${ARGV[4]}
-LPORT=${ARGV[5]}
-DBNM=${ARGV[6]}
-SCMA=${ARGV[7]}
-REL=${ARGV[8]}
-LOCK=${ARGV[9]}
+PASS=${ARGV[2]}
+PASS=`echo "$PASS"|base64 -di`
+INDX=${ARGV[3]}
+SIZE=${ARGV[4]}
+TYPE=${ARGV[5]}
+LPORT=${ARGV[6]}
+DBNM=${ARGV[7]}
+SCMA=${ARGV[8]}
+REL=${ARGV[9]}
+LOCK=${ARGV[10]}
 LOCK=`echo "$LOCK"|base64 -di`
-ENCD=${ARGV[10]}
-SEED=${ARGV[11]}
-WHERE=${ARGV[12]}
+ENCD=${ARGV[11]}
+SEED=${ARGV[12]}
+WHERE=${ARGV[13]}
 WHERE=`echo "$WHERE"|base64 -di`
 . GPHOME_REPLACE/greenplum_path.sh >/dev/null 2>&1
 NMBR=`cat $KEY.info|wc -l`
@@ -227,7 +229,7 @@ RINFO=`cat $KEY.info|sed -n 1p`
 RARRAY=(${RINFO//,/ })
 RIP=${RARRAY[1]}
 RPORT=${RARRAY[2]}
-PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
+PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER PGPASSWORD=$PASS psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
 SET CLIENT_ENCODING TO $ENCD;
 $LOCK;
 COPY (SELECT * FROM "$SCMA"."$REL"$WHERE) TO STDOUT;
@@ -241,18 +243,17 @@ RARRAY=(${RINFO//,/ })
 RCNTT=${RARRAY[0]}
 RIP=${RARRAY[1]}
 RPORT=${RARRAY[2]}
-if ["TEST" == $WHERE ];then
+if [ "TEST" == $WHERE ];then
 CCNTT=`PGOPTIONS='-c gp_session_role=utility' PGUSER=$USER psql -d postgres -h $RIP -p $RPORT $DBNM -qtAXc "show gp_contentid"`
-if [ $CCNTT != $RCNTT ];then
-exit 1
-fi
-fi
-PGOPTIONS='-c gp_session_role=utility' PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
+if [ $CCNTT != $RCNTT ];then exit 1;fi
+else
+PGOPTIONS='-c gp_session_role=utility' PGAPPNAME="GPDBTRANSFER.$KEY.$INDX" PGUSER=$USER PGPASSWORD=$PASS psql -v ON_ERROR_STOP=1 -v "ID=GPDBTRANSFER.$KEY.$INDX.$LPORT" -qtAX -h $RIP -p $RPORT -d $DBNM <<EOF
 SET CLIENT_ENCODING TO $ENCD;
 $LOCK;
 COPY (SELECT * FROM "$SCMA"."$REL"$WHERE) TO STDOUT;
 EOF
 ERR=$?;if [ $ERR -ne 0 ];then exit $ERR;fi
+fi
 LCNTT=$((LCNTT+SIZE))
 done
 fi
@@ -932,7 +933,9 @@ sub generateSrcClusterInfo{
 }
 sub checkCleverCommand{
     logMessage("INFO","Check DEST magic command file");
-    my $checkSql = qq{select distinct gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/gpdbtransfercat.sh ];then md5sum /tmp/fifo/gpdbtransfercat.sh|cut -c 1-32;fi') from gp_dist_random('gp_id');};
+    my $checkSql = qq{select distinct gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/gpdbtransfercat.sh ];then md5sum /tmp/fifo/gpdbtransfercat.sh|cut -c 1-32;fi') from gp_dist_random('gp_id')
+union
+select gp_toolkit.gp_transfer_execute('if [ -f /tmp/fifo/gpdbtransfercat.sh ];then md5sum /tmp/fifo/gpdbtransfercat.sh|cut -c 1-32;fi');};
     my @result = queryResult("DEST",$checkSql);
     my $clever_command = $CMD_CLEVER_COMMAND;
     $clever_command =~ s/GPHOME_REPLACE/$DEST_GPHOME/;
@@ -940,6 +943,7 @@ sub checkCleverCommand{
     my $str_md5 = trim(readpipe(qq{echo "$str_base64"|base64 -di|md5sum|cut -c 1-32}));
     if(@result > 1 || $str_md5 ne $result[0][0]){
         logMessage("INFO","DEST magic command file [/tmp/fifo/gpdbtransfercat.sh] not exists or need upgrade");
+        my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/gpdbtransfercat.sh');});
         my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/gpdbtransfercat.sh') from gp_dist_random('gp_id');});
     }
 }
@@ -998,7 +1002,7 @@ sub processTableArray{
             logMessage("WARN","Table name specify is not legal:[$table]");
             next;
         }
-        $specify_table_hash{$table} = ([$table]);
+        $specify_table_hash{$table} = ([$scma,$rel]);
     }
     for my $row(getTableFromFile($TABLE_FILE)){
         my ($src_table,$dest_table,$where) = @$row;
@@ -1244,13 +1248,16 @@ sub checkTransferSchema{
 sub checkContentConsistent{
     my $checkTable = 'gpdbtransfer.transform_'.$KEY.'_0';
     queryResult("DEST","drop external table if exists $checkTable;","CV");
+    my $base64_pass = encode("" eq $SRC_PASSWD ? "--" : $SRC_PASSWD);
     my $base64_lock = encode("--");
-    my $base64_where = encode("--");
+    my $base64_where = encode("TEST");
     my $checkSql = qq{drop external table if exists $checkTable;\n};
     $checkSql = $checkSql."create external web table $checkTable(\n";
     $checkSql = $checkSql."cntt int\n";
-    $checkSql = $checkSql.")execute E'sh /tmp/fifo/gpdbtransfercat.sh /tmp/fifo/gpdbtransfercat.sh $KEY.0.$DEST_SEG_SIZE.\$GP_SEG_PORT.$SRC_DATABASE.TEST.TEST.$base64_lock.$ENCODING.0.$base64_where'";
-    $checkSql = $checkSql." ON ALL FORMAT 'TEXT' ENCODING '$ENCODING';";
+    $checkSql = $checkSql.")execute E'sh /tmp/fifo/gpdbtransfercat.sh $KEY.$SRC_USER.$base64_pass.0.$DEST_SEG_SIZE";
+    $checkSql = $checkSql.".S.\$GP_SEG_PORT.$SRC_DATABASE.M.C.$base64_lock.$ENCODING.0.$base64_where'";
+    $checkSql = $checkSql."\nON ALL FORMAT 'TEXT' ENCODING '$ENCODING';";
+    $checkSql = $checkSql."\nselect count(*) from $checkTable;";
     my ($code,$value) = queryResult("DEST",$checkSql,"CV");
     queryResult("DEST","drop external table if exists $checkTable;","CV");
     if($code > 0){
@@ -1354,6 +1361,7 @@ sub executeTransfer{
     my $dest_ext_table = 'gpdbtransfer.transform_'.$KEY."_".$thread_index;
     my $task = $TASK_QUEUE->dequeue();
     my ($code,$value);
+    my $base64_pass = encode("" eq $SRC_PASSWD ? "--" : $SRC_PASSWD);
     while(defined $task){
         my @stat_msg :shared;
         my ($src_table,$dest_table,$where,$relkind,$dep_tables,$src_tim,$count) = @$task;
@@ -1394,12 +1402,11 @@ sub executeTransfer{
             my $dest_ext_ddl = "drop external table if exists $dest_ext_table;\n";
             $dest_ext_ddl = $dest_ext_ddl."create external web table $dest_ext_table(\n";
             $dest_ext_ddl = $dest_ext_ddl.qq{like $dest_tableqq};
-            $dest_ext_ddl = $dest_ext_ddl."\n)execute E'sh /tmp/fifo/gpdbtransfercat.sh $KEY.$SRC_USER.$thread_index.$DEST_SEG_SIZE";
+            $dest_ext_ddl = $dest_ext_ddl."\n)execute E'sh /tmp/fifo/gpdbtransfercat.sh $KEY.$SRC_USER.$base64_pass.$thread_index.$DEST_SEG_SIZE";
             $dest_ext_ddl = $dest_ext_ddl.($from_master ? ".M" : ".S");
             $dest_ext_ddl = $dest_ext_ddl.".\$GP_SEG_PORT.$SRC_DATABASE.$src_scma.$src_rel.$base64_lock.$ENCODING.$random.$base64_where'";
             if($from_master){
-                my $random_seg = int(rand($DEST_SEG_SIZE)) % $DEST_SEG_SIZE;
-                $dest_ext_ddl = $dest_ext_ddl." ON SEGMENT $random_seg";
+                $dest_ext_ddl = $dest_ext_ddl." ON MASTER";
             }else{
                 $dest_ext_ddl = $dest_ext_ddl." ON ALL";
             }
