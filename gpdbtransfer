@@ -930,6 +930,7 @@ sub generateSrcClusterInfo{
     my $srcClusterInfo = join("\n",@srcClusterInfoArray)."\n";
     my $str_base64 = encode_base64($srcClusterInfo);
     my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/$KEY.info') from gp_dist_random('gp_id');});
+    my ($code,$value) = queryResult("DEST",qq{select gp_toolkit.gp_transfer_execute('echo "$str_base64"|base64 -di > /tmp/fifo/$KEY.info');});
 }
 sub checkCleverCommand{
     logMessage("INFO","Check DEST magic command file");
