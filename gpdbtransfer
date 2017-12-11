@@ -274,13 +274,13 @@ SYNOPSIS
 ************************************************************************************************
 $CMD_NAME --src-host hostname
     [--src-port database port]
-    [--src-user database user]
-    [--src-passwd database password]
+    [--src-user database user]          [base64]
+    [--src-passwd database password]    [base64]
     --src-database database name
     --dest-host hostname
     [--dest-port database port]
-    [--dest-user database user]
-    [--dest-passwd database password]
+    [--dest-user database user]         [base64]
+    [--dest-passwd database password]   [base64]
     --dest-database database name
     [--key identity number]
     --src-mapfile filename
@@ -303,6 +303,12 @@ $CMD_NAME --src-host hostname
     [--log-path directory]
     [--parameter-file filename]
     [-h|--help]
+
+For those options end with [base64], you can specify base64 encode.
+You can specify the value like:
+src-passwd=base64Z3BhZG1pbg==
+means:
+src-passwd=gpadmin
 *****************************************************
 DESCRIPTION
 *****************************************************
@@ -797,6 +803,11 @@ sub checkOption{
     logMessage("INFO","Option values: -s ".join(' -s ',@SCHEMA_ARRAY)." -S ".join(' -S ',@EX_SCHEMA_ARRAY));
     logMessage("INFO","Option values: --increment $INCREMENT --delete $NEED_DELETE --truncate $NEED_TRUNCATE --analyze $NEED_ANALYZE --encoding $ENCODING -B $BATCH_SIZE");
     logMessage("INFO","Option values: --where $GLOBAL_CONDITION --log-path $LOG_PATH --parameter-file $PARAMETER_FILE");
+    for my $ref((\$SRC_USER,\$SRC_PASSWD,\$DEST_USER,\$DEST_PASSWD)){
+        if(uc($$ref) =~ /^BASE64/){
+            $$ref = trim(decode_base64(substr($$ref,6)));
+        }
+    }
 }
 sub checkSrcRandomTable{
     if(!$INCREMENT){
