@@ -1,4 +1,4 @@
-# gp-advanced-backup-and-restore
+# gp-advanced-toolkit
 gpdbbackup
 gp数据库备份命令，配合gpdbrestore使用
 gpdbrestore
