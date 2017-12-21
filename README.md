@@ -1,4 +1,7 @@
-# gp-advanced-toolkit
+# gp-magic
+名称确定为gp-magic，感谢Ryan Wei给起了个这么高大上的名字
+出于分享精神，打算后续多放点有通用性价值的小工具上来
+
 gpdbbackup
 gp数据库备份命令，配合gpdbrestore使用
 gpdbrestore
