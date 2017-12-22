@@ -43,7 +43,7 @@ drop external table if exists gp_toolkit.gp_segment_config_ext;};
 
 my $GET_ALL_USER_TABLE_SQL = q{select '',replace(encode(textsend(n.nspname),'base64'),chr(10),''),replace(encode(textsend(c.relname),'base64'),chr(10),'')
     from pg_class c,pg_namespace n,gp_distribution_policy p
-    where c.relnamespace=n.oid and c.oid=p.localoid and (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%'
+    where c.relnamespace=n.oid and c.oid=p.localoid and (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
     and c.relkind='r' and relstorage<>'x' and c.oid not in(select parchildrelid from pg_partition_rule);};
 
 my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
@@ -52,7 +52,7 @@ my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
         where c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
         and c.oid not in(select parchildrelid from pg_partition_rule)
 ), all_child as (
     select parrelid,parchildrelid,nspname,relname,relstorage from(
@@ -62,7 +62,7 @@ my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
         where pr.paroid = p.oid and pr.parchildrelid = c.oid and c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
     ) t where rank = 1
 ), last_oper as (
     select objid,max(statime) statime from pg_stat_last_operation
@@ -96,7 +96,7 @@ my $SQL_GET_ALL_USER_VIEW = q{with dep_all as(
         and dt.refclassid = 1259
         and dv.deptype = 'i'
         and (nv.oid > 16384 or nv.nspname = 'public')
-        and nv.nspname not like E'pg\_temp\_%'
+        and nv.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
         group by 1,2,3,4,5
 ),dep_multi as(
     select void,nspname,relname from (
@@ -113,7 +113,7 @@ select replace(encode(textsend(n.nspname),'base64'),chr(10),''),replace(encode(t
     replace(encode(textsend(dep.deptables),'base64'),chr(10),'') from pg_class c
     join pg_namespace n on c.relnamespace=n.oid
     left join dep on c.oid = dep.void and dep.nbr <= 8
-    where (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%'
+    where (c.relnamespace>16384 or n.nspname='public') and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
     and c.relkind='v';};
 
 

@@ -27,7 +27,7 @@ my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
         where c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
         and c.oid not in(select parchildrelid from pg_partition_rule)
 ), all_child as (
     select parrelid,parchildrelid,nspname,relname from(
@@ -37,7 +37,7 @@ my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
         where pr.paroid = p.oid and pr.parchildrelid = c.oid and c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
     ) t where rank = 1
 )
 select replace(encode(textsend(x.nspname),'base64'),chr(10),''),
@@ -53,7 +53,7 @@ my $GET_PARENT_CHILD_LIST_NO_ERROR_SQL = q{with all_parent as (
         where c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
         and c.oid not in(select parchildrelid from pg_partition_rule)
         and c.oid not in(select attrelid from pg_attribute
             where attnum>0 group by 1 having string_agg(attname,',' order by attnum) = 'cmdtime,relname,filename,linenum,bytenum,errmsg,rawdata,rawbytes'
@@ -66,7 +66,7 @@ my $GET_PARENT_CHILD_LIST_NO_ERROR_SQL = q{with all_parent as (
         where pr.paroid = p.oid and pr.parchildrelid = c.oid and c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
         and (n.oid > 16384 or n.nspname = 'public')
-        and n.nspname not like E'pg\_temp\_%'
+        and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
     ) t where rank = 1
 )
 select replace(encode(textsend(x.nspname),'base64'),chr(10),''),
