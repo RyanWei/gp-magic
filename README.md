@@ -1,6 +1,5 @@
 # gp-magic
-此repository的所有代码遵从GPL3协议，任何获取本repository代码的主体不得用于任何商业目的，因为您的代码也必须开源
-此repository仅有一个贡献者：陈淼 [ miaochen@mail.ustc.edu.cn ]，在未得到本人授权之前，任何人不得剽窃代码中的任何理念
+此repository的所有代码遵从GPL3协议，任何获取本repository代码的主体不得用于任何商业目的，因为您的代码也必须开源，此repository仅有一个贡献者：陈淼 [ miaochen@mail.ustc.edu.cn ]，在未得到本人授权之前，任何人不得剽窃代码中的任何理念
 
 名称确定为gp-magic，感谢Ryan Wei给起了个这么高大上的名字
 出于分享精神，打算后续多放点有通用性价值的小工具上来
