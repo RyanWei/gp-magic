@@ -96,12 +96,12 @@ sub getLocation{
     if($DBState ne "shut down" && not $FORCE){
         errorMessage("Database state [$DBState] is not shut down");
     }
-    $REDOLocation = trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'REDO location'#));
+    $REDOLocation = lc(trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'REDO location'#)));
     $REDOLocation = trim((split(/:/,$REDOLocation))[1]);
     my ($redo_first,$redo_second) = split(/\//,$REDOLocation);
     ($redo_first,$redo_second) = (substr("00000000".$redo_first,-8),substr("00000000".$redo_second,-8));
     $REDOLocation = $redo_first.$redo_second;
-    $UNDOLocation = trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'UNDO location'#));
+    $UNDOLocation = lc(trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'UNDO location'#)));
     $UNDOLocation = trim((split(/:/,$UNDOLocation))[1]);
     my ($undo_first,$undo_second) = split(/\//,$UNDOLocation);
     ($undo_first,$undo_second) = (substr("00000000".$undo_first,-8),substr("00000000".$undo_second,-8));
