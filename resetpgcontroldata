@@ -1,0 +1,138 @@
+#!/usr/bin/perl
+use strict;
+use Switch;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use POSIX;
+use File::Copy;
+
+my ($DIRECTORY,$DRYRUN,$FORCE,$DBState,$REDOLocation,$UNDOLocation,$IS_HELP);
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+my $MAIN_PID = substr("000000".$$,-6);
+my $BACKUP_FILE;
+
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+$CMD_NAME [-d | -D | --directory path] [-f | -F | --force] [-h | --help]
+The $CMD_NAME utility is used to reset the xlog..
+*****************************************************
+OPTIONS
+*****************************************************
+
+-d | -D | --directory <path>
+
+  Postgresql instance work directory.
+  eg.
+
+  -d /data/master/gpseg-1
+
+--dry-run
+
+  When you specify this option, $CMD_NAME display the redo and undo information.
+  But ignore the file modify.
+
+-f | -F | --force
+
+  Force reset even if the database's stats is not 'shut down'
+
+-h|--help
+  Displays the online help.
+#;
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+sub printMessage{
+    my ($flag,$msg) = @_;
+    if("RAW" ne $flag){
+        my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime).$MAIN_PID;
+        $msg = "$time_flag-[$flag]-:$msg\n";
+    }
+    print $msg;
+}
+sub errorMessage{
+    my ($msg) = @_;
+    printMessage("ERROR",$msg);
+    print "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exit 1;
+}
+sub getOption{
+    GetOptions(
+        'd|D|directory:s' => \$DIRECTORY,
+        'dry-run!'	  => \$DRYRUN,
+        'f|F|force!'      => \$FORCE,
+        'h|help!'         => \$IS_HELP,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exit 0;
+    }
+}
+sub checkOption{
+    if("" eq $DIRECTORY){
+        errorMessage("Please specify parameter: -d|-D|--directory");
+    }
+}
+sub checkFile{
+    if(-e "$DIRECTORY/global/pg_control"){
+        if(!$DRYRUN){
+            my $time_flag = strftime("%Y%m%d%H%M%S",localtime);
+            $BACKUP_FILE = "$DIRECTORY/global/pg_control.$time_flag";
+            printMessage("INFO","Backup file $DIRECTORY/global/pg_control to $BACKUP_FILE");
+            copy("$DIRECTORY/global/pg_control",$BACKUP_FILE);
+        }
+    }else{
+        errorMessage("File [$DIRECTORY/global/pg_control] not exists");
+    }
+}
+sub getLocation{
+    $DBState = readpipe(qq{pg_controldata $DIRECTORY|grep 'Database cluster state'});
+    $DBState = trim((split(/:/,$DBState))[1]);
+    if($DBState ne "shut down" && not $FORCE){
+        errorMessage("Database state [$DBState] is not shut down");
+    }
+    $REDOLocation = trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'REDO location'#));
+    $REDOLocation = trim((split(/:/,$REDOLocation))[1]);
+    my ($redo_first,$redo_second) = split(/\//,$REDOLocation);
+    ($redo_first,$redo_second) = (substr("00000000".$redo_first,-8),substr("00000000".$redo_second,-8));
+    $REDOLocation = $redo_first.$redo_second;
+    $UNDOLocation = trim(readpipe(qq#pg_controldata $DIRECTORY|grep 'UNDO location'#));
+    $UNDOLocation = trim((split(/:/,$UNDOLocation))[1]);
+    my ($undo_first,$undo_second) = split(/\//,$UNDOLocation);
+    ($undo_first,$undo_second) = (substr("00000000".$undo_first,-8),substr("00000000".$undo_second,-8));
+    $UNDOLocation = $undo_first.$undo_second;
+    printMessage("INFO","Database cluster state           :      $DBState");
+    printMessage("INFO","Latest checkpoint's REDO location:      $REDOLocation");
+    printMessage("INFO","Latest checkpoint's UNDO location:      $UNDOLocation");
+}
+sub resetFile{
+    if($DRYRUN){
+        return;
+    }
+    my ($new,$old) = ($REDOLocation,$UNDOLocation);
+    my $new = substr($new,6,2).substr($new,4,2)." ".substr($new,2,2).substr($new,0,2)." ".substr($new,14,2).substr($new,12,2)." ".substr($new,10,2).substr($new,8,2);
+    my $old = substr($old,6,2).substr($old,4,2)." ".substr($old,2,2).substr($old,0,2)." ".substr($old,14,2).substr($old,12,2)." ".substr($old,10,2).substr($old,8,2);
+    my $command = qq{xxd $BACKUP_FILE|sed '5s/0000040: $old/0000040 $new/'|xxd -r > $DIRECTORY/global/pg_control};
+    system($command);
+    system(qq{pg_resetxlog $DIRECTORY -f});
+}
+sub main{
+    getOption();
+    checkOption();
+    printMessage("INFO","Start reset process".("." x 66));
+    printMessage("INFO","Run command: ".$_[0]);
+    checkFile();
+    printMessage("INFO","Get oraginal pg_control location");
+    getLocation();
+    resetFile();
+    printMessage("INFO","Get new pg_control location");
+    getLocation();
+}
+my $command_string = $0." ".join(" ",@ARGV);
+$|=1;
+main($command_string);
