@@ -641,11 +641,11 @@ sub queryResult{
     my ($src_or_dest,$query_sql,$return_flag) = @_;
     my $OPTS = "PGAPPNAME=gpdbtransfer ";
     if("SRC" eq $src_or_dest){
-        $OPTS = $OPTS."PGHOST=$SRC_HOST PGDATABASE=$SRC_DATABASE PGPORT=$SRC_PORT ";
-        $OPTS = $OPTS.("" ne $SRC_USER ? "PGUSER=$SRC_USER " : "").("" ne $SRC_PASSWD ? "PGPASSWORD=$SRC_PASSWD " : "");
+        $OPTS = $OPTS."PGHOST='$SRC_HOST' PGDATABASE='$SRC_DATABASE' PGPORT=$SRC_PORT ";
+        $OPTS = $OPTS.("" ne $SRC_USER ? "PGUSER='$SRC_USER' " : "").("" ne $SRC_PASSWD ? "PGPASSWORD='$SRC_PASSWD' " : "");
     }elsif("DEST" eq $src_or_dest){
-        $OPTS = $OPTS."PGHOST=$DEST_HOST PGDATABASE=$DEST_DATABASE PGPORT=$DEST_PORT ";
-        $OPTS = $OPTS.("" ne $DEST_USER ? "PGUSER=$DEST_USER " : "").("" ne $DEST_PASSWD ? "PGPASSWORD=$DEST_PASSWD " : "");
+        $OPTS = $OPTS."PGHOST='$DEST_HOST' PGDATABASE='$DEST_DATABASE' PGPORT=$DEST_PORT ";
+        $OPTS = $OPTS.("" ne $DEST_USER ? "PGUSER='$DEST_USER' " : "").("" ne $DEST_PASSWD ? "PGPASSWORD='$DEST_PASSWD' " : "");
     }
     my $query_result = readpipe($OPTS."psql -v ON_ERROR_STOP=1 -tAXF '#!^' 2>&1 <<'END_OF_SQL'\n".'\encoding UTF8;'."\n".$query_sql."\nEND_OF_SQL\n");
     my $return_code = $? >> 8;
