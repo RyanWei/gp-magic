@@ -96,7 +96,7 @@ my $SQL_GET_ALL_USER_VIEW = q{with dep_all as(
         and dt.refclassid = 1259
         and dv.deptype = 'i'
         and (nv.oid > 16384 or nv.nspname = 'public')
-        and nv.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
+        and nv.nspname not like E'pg\_temp\_%' and nv.nspname not like E'pg\_toast\_temp\_%'
         group by 1,2,3,4,5
 ),dep_multi as(
     select void,nspname,relname from (
