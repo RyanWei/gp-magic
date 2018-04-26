@@ -1,6 +1,5 @@
 #!/usr/bin/perl
 use strict;
-use Switch;
 use MIME::Base64;
 use threads;
 use Thread::Queue;
@@ -41,7 +40,7 @@ select count(*) from gp_toolkit.gp_segment_config_ext;
 drop external table if exists gp_toolkit.gp_segment_config_ext;};
 
 my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
-    select c.oid,nspname,relname,relstorage
+    select c.oid,nspname,relname,relstorage,relpages
     from pg_class c, pg_namespace n
         where c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
@@ -49,9 +48,9 @@ my $GET_PARENT_CHILD_LIST_SQL = q{with all_parent as (
         and n.nspname not like E'pg\_temp\_%' and n.nspname not like E'pg\_toast\_temp\_%'
         and c.oid not in(select parchildrelid from pg_partition_rule)
 ), all_child as (
-    select parrelid,parchildrelid,nspname,relname,relstorage from(
+    select parrelid,parchildrelid,nspname,relname,relstorage,relpages from(
         select p.parrelid,pr.parchildrelid,p.parlevel,n.nspname,c.relname,c.relstorage,
-            rank() over(partition by parrelid order by parlevel desc) rank
+            rank() over(partition by parrelid order by parlevel desc) rank,relpages
         from pg_partition p, pg_partition_rule pr, pg_class c, pg_namespace n
         where pr.paroid = p.oid and pr.parchildrelid = c.oid and c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
@@ -77,10 +76,11 @@ left join all_child y on x.oid = y.parrelid
 left join last_oper p on x.oid = p.objid
 left join last_oper c on y.parchildrelid = c.objid
 left join aosegname a1 on x.oid = a1.oid
-left join aosegname a2 on y.parchildrelid = a2.oid;};
+left join aosegname a2 on y.parchildrelid = a2.oid
+order by decode(y.relpages,y.relpages,x.relpages) desc;};
 
 my $GET_PARENT_CHILD_LIST_NO_ERROR_SQL = q{with all_parent as (
-    select c.oid,nspname,relname,relstorage
+    select c.oid,nspname,relname,relstorage,relpages
     from pg_class c, pg_namespace n
         where c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
@@ -91,9 +91,9 @@ my $GET_PARENT_CHILD_LIST_NO_ERROR_SQL = q{with all_parent as (
             where attnum>0 group by 1 having string_agg(attname,',' order by attnum) = 'cmdtime,relname,filename,linenum,bytenum,errmsg,rawdata,rawbytes'
         )
 ), all_child as (
-    select parrelid,parchildrelid,nspname,relname,relstorage from(
+    select parrelid,parchildrelid,nspname,relname,relstorage,relpages from(
         select p.parrelid,pr.parchildrelid,p.parlevel,n.nspname,c.relname,c.relstorage,
-            rank() over(partition by parrelid order by parlevel desc) rank
+            rank() over(partition by parrelid order by parlevel desc) rank,relpages
         from pg_partition p, pg_partition_rule pr, pg_class c, pg_namespace n
         where pr.paroid = p.oid and pr.parchildrelid = c.oid and c.relnamespace = n.oid
         and c.relkind = 'r' and c.relstorage <> 'x'
@@ -119,7 +119,8 @@ left join all_child y on x.oid = y.parrelid
 left join last_oper p on x.oid = p.objid
 left join last_oper c on y.parchildrelid = c.objid
 left join aosegname a1 on x.oid = a1.oid
-left join aosegname a2 on y.parchildrelid = a2.oid;};
+left join aosegname a2 on y.parchildrelid = a2.oid
+order by decode(y.relpages,y.relpages,x.relpages) desc;};
 
 my $EXECUTE_FUNCTION_ARG_CHECK_SQL = q{select string_agg(t.typname,',' order by a.idx) from(
     select proargtypes typs,generate_series(0,array_upper(proargtypes,1)) idx from pg_proc
