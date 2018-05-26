@@ -6,10 +6,10 @@ use Thread::Queue;
 use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
 use POSIX;
 
-my ($DATABASE_NAME,$BACKUP_DB,$PORT,@TABLE_ARRAY,@EX_TABLE_ARRAY,$TABLE_FILE,$EX_TABLE_FILE,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,$BATCH_SIZE,$DIRECTORY,$GLOBAL_CONDITION,$DATE_FROM,$DATE_TO,$DATE_FLAG,
+my ($DATABASE_NAME,$BACKUP_DB,$PORT,@TABLE_ARRAY,@EX_TABLE_ARRAY,$TABLE_FILE,$EX_TABLE_FILE,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,$BATCH_SIZE,$DIRECTORY,$GLOBAL_CONDITION,$TIME_FROM,$TIME_TO,$TIME_FLAG,
     $FORCE_REDO,$DATA_ONLY,$NEED_TRUNCATE,$NO_ERROR_TABLE,$ENCODING,$PARAMETER_FILE,$IS_HELP);
 my ($MASTER_BACKUP_PATH,$MASTER_LOG_PATH,$MASTER_LOG_FILE,$MASTER_DONE_FILE,$LOG_FILE_HANDLE);
-my ($LOG_FILE_NAME,$DONE_FILE_NAME,$BACKUP_DONE_FILE_NAME) = ("restore_log.log","restore_done.log","backup_done.log");
+my ($LOG_FILE_NAME,$LAST_STAT_FILE_NAME,$DONE_FILE_NAME) = ("restore_log.log","last_stat.tag","restore_done.log");
 my ($TASK_QUEUE,$MSG_QUEUE);
 my (@TASK_THREAD,$MSG_THREAD,$LOCK_THREAD);
 my (%ALL_INDEX_MAP,@INDEX_CREATE_LIST,@INDEX_DROP_LIST);
@@ -96,7 +96,7 @@ my $STR_CLEVER_CMD = q[#!/bin/bash
 cd $(cd "$(dirname "$0")"; pwd)
 . GPHOME_REPLACE/greenplum_path.sh
 DIRC=$1
-DATE=$2
+TIME=$2
 PORT=$3
 FLNM=$4
 SELF=$5
@@ -105,9 +105,9 @@ FLNM=${FLNM#*.}
 SCMA=${FLNM%%.*}
 TBNM=${FLNM#*.}
 CNTT=`PGOPTIONS='-c gp_session_role=utility' psql -d postgres -p $PORT -qtAXc "show gp_contentid"`
-FILE=$DIRC/db_dumps/$DATE/$DBNM^$CNTT^$SCMA.$TBNM.gz
+FILE=$DIRC/db_dumps/$TIME/$DBNM^$CNTT^$SCMA.$TBNM.gz
 if [ "$SELF" == "1" ];then
-FILE=$DIRC/gpseg$CNTT/db_dumps/$DATE/$DBNM^$CNTT^$SCMA.$TBNM.gz
+FILE=$DIRC/gpseg$CNTT/db_dumps/$TIME/$DBNM^$CNTT^$SCMA.$TBNM.gz
 fi
 cat $FILE|gunzip
 ERR=$?
@@ -164,9 +164,9 @@ $CMD_NAME --database database name
     [-B batch_size]
     [--directory directory]
     [--where condition]
-    --date-from date
-    --date-to date
-    [--date-flag date_flag]
+    --time-from time
+    --time-to time 
+    [--time-flag time_flag]
     [--force-redo]
     [-a]
     [--truncate]
@@ -279,20 +279,20 @@ OPTIONS
   eg.:
   --where "data_date='2016-01-01'"
 
---date-from <date>
+--time-from <time>
 
-  Restore find backup data file from this date.
+  Restore find backup data file from this time.
 
---date-to <date>
+--time-to <time>
 
-  Restore find backup data file until this date.
+  Restore find backup data file until this time.
 
---date-flag <date>
+--time-flag <time>
 
-  Restore date flag.
+  Restore time flag.
   If not specified, $CMD_NAME will use the current data as the flag.
   eg.:
-  --date-flag 20160101
+  --time-flag 20140825082500
 
 -a
 
@@ -300,9 +300,9 @@ OPTIONS
 
 --force-redo
 
-   Backup will check the success log file in the current backup directory.
-   Default, backup will ignore the table which found in the success log file.
-   With this parameter, backup will ignore the success log file.
+   Restore will check the success log file in the current restore directory.
+   Default, restore will ignore the table which found in the success log file.
+   With this parameter, restore will ignore the success log file.
 
 --truncate
 
@@ -330,8 +330,8 @@ OPTIONS
   Displays the online help.
 
 Examples:
-$CMD_NAME --database postgres --date-from 20170115 --date-to 20170115 --port 4371 --truncate -a
-$CMD_NAME --database postgres --date-from 20170115 --date-to 20170115 --port 4371 --truncate --force-redo -a
+$CMD_NAME --database postgres --time-from 20140825082500 --time-to 20150825082500 --port 4371 --truncate -a
+$CMD_NAME --database postgres --time-from 20140825082500 --time-to 20150825082500 --port 4371 --truncate --force-redo -a
 $CMD_NAME -h
 #;
 
@@ -446,8 +446,8 @@ sub getOption{
         'F:s'              => \$EX_TABLE_FILE,   's:s'               => \@SCHEMA_ARRAY,
         'S:s'              => \@EX_SCHEMA_ARRAY, 'B:i'               => \$BATCH_SIZE,
         'directory:s'      => \$DIRECTORY,       'where:s'           => \$GLOBAL_CONDITION,
-        'date-from:i'      => \$DATE_FROM,       'date-to:i'         => \$DATE_TO,
-        'date-flag:i'      => \$DATE_FLAG,       'force-redo!'       => \$FORCE_REDO,
+        'time-from:i'      => \$TIME_FROM,       'time-to:i'         => \$TIME_TO,
+        'time-flag:i'      => \$TIME_FLAG,       'force-redo!'       => \$FORCE_REDO,
         'a!'               => \$DATA_ONLY,       'truncate!'         => \$NEED_TRUNCATE,
         'no-error!'        => \$NO_ERROR_TABLE,  'encoding:s'        => \$ENCODING,
         'parameter-file:s' => \$PARAMETER_FILE,  'h|help!'           => \$IS_HELP,
@@ -476,9 +476,9 @@ sub getOption{
             if("B"                eq $para && "" eq $BATCH_SIZE        ){$BATCH_SIZE           = $val;}
             if("directory"        eq $para && "" eq $DIRECTORY         ){$DIRECTORY            = $val;}
             if("where"            eq $para && "" eq $GLOBAL_CONDITION  ){$GLOBAL_CONDITION     = $val;}
-            if("date-from"        eq $para && "" eq $DATE_FROM         ){$DATE_FROM            = $val;}
-            if("date-to"          eq $para && "" eq $DATE_TO           ){$DATE_TO              = $val;}
-            if("date-flag"        eq $para && "" eq $DATE_FLAG         ){$DATE_FLAG            = $val;}
+            if("time-from"        eq $para && "" eq $TIME_FROM         ){$TIME_FROM            = $val;}
+            if("time-to"          eq $para && "" eq $TIME_TO           ){$TIME_TO              = $val;}
+            if("time-flag"        eq $para && "" eq $TIME_FLAG         ){$TIME_FLAG            = $val;}
             if("force-redo"       eq $para && "" eq $FORCE_REDO        ){$FORCE_REDO           = 1   ;}
             if("a"                eq $para && "" eq $DATA_ONLY         ){$DATA_ONLY            = 1   ;}
             if("truncate"         eq $para && "" eq $NEED_TRUNCATE     ){$NEED_TRUNCATE        = 1   ;}
@@ -496,17 +496,17 @@ sub checkOption{
     if("" eq $PORT){
         $PORT = '5432';
     }
-    if("" eq $DATE_FROM){
-        errorMessage("Please specify parameter: --date-from");
+    if("" eq $TIME_FROM){
+        errorMessage("Please specify parameter: --time-from");
     }
-    if("" eq $DATE_TO){
-        errorMessage("Please specify parameter: --date-to");
+    if("" eq $TIME_TO){
+        errorMessage("Please specify parameter: --time-to");
     }
-    if($DATE_FROM > $DATE_TO){
-        errorMessage("Start date(--date-from) can't bigger than end date(--date-to)");
+    if($TIME_FROM > $TIME_TO){
+        errorMessage("Start time(--time-from) can't bigger than end time(--time-to)");
     }
-    if("" eq $DATE_FLAG){
-        $DATE_FLAG = strftime("%Y%m%d",localtime);
+    if("" eq $TIME_FLAG){
+        $TIME_FLAG = strftime("%Y%m%d%H%M%S",localtime);
     }
     if("" eq $BATCH_SIZE || $BATCH_SIZE > $BATCH_MAX || $BATCH_SIZE < $BATCH_MIN){
         logMessage("NOTICE","Not specify or out of limit, use default($BATCH_DEFAULT): -B");
@@ -524,7 +524,7 @@ sub checkOption{
     logMessage("INFO","Option values: -t ".join(' -t ',@TABLE_ARRAY)." -T ".join(' -T ',@EX_TABLE_ARRAY));
     logMessage("INFO","Option values: -f $TABLE_FILE -F $EX_TABLE_FILE -s ".join(' -s ',@SCHEMA_ARRAY)." -S ".join(' -S ',@EX_SCHEMA_ARRAY));
     logMessage("INFO","Option values: -B $BATCH_SIZE --directory $DIRECTORY --where $GLOBAL_CONDITION");
-    logMessage("INFO","Option values: --date-from $DATE_FROM --date-to $DATE_TO --date-flag $DATE_FLAG");
+    logMessage("INFO","Option values: --time-from $TIME_FROM --time-to $TIME_TO --time-flag $TIME_FLAG");
     logMessage("INFO","Option values: --force-redo $FORCE_REDO -a $DATA_ONLY --truncate $NEED_TRUNCATE --no-error $NO_ERROR_TABLE --encoding $ENCODING --parameter-file $PARAMETER_FILE");
 }
 sub processDataDirectory{
@@ -534,7 +534,7 @@ sub processDataDirectory{
     }else{
         $MASTER_BACKUP_PATH = $MASTER_BACKUP_PATH."/gpseg-1/db_dumps/";
     }
-    $MASTER_LOG_PATH = $MASTER_BACKUP_PATH.$DATE_FLAG;
+    $MASTER_LOG_PATH = $MASTER_BACKUP_PATH.$TIME_FLAG;
     my $value = readpipe("mkdir -p ".$MASTER_LOG_PATH);
     my $code = $? >> 8;
     if($code != 0){
@@ -704,9 +704,9 @@ sub processTableArray{
     my $check_specify = 0;
     if(keys %specify_table_hash > 0 || keys %specify_schema_hash > 0 || "" ne $TABLE_FILE){
         $check_specify = 1;
-        logMessage("INFO","Backup table from parameter or file in database: $DATABASE_NAME");
+        logMessage("INFO","Restore table from parameter or file in database: $DATABASE_NAME");
     }else{
-        logMessage("INFO","Backup all user table in database: $DATABASE_NAME");
+        logMessage("INFO","Restore all user table in database: $DATABASE_NAME");
     }
     @TABLE_ARRAY = ();
     for my $row(@all_parent_child_list){
@@ -735,26 +735,26 @@ sub processTableArray{
     }
     #####################################################################################################
 }
-sub getLastBackupDoneFromFile{
-    my %last_done_map = ();
-    my $date_string = readpipe("ls -1L $MASTER_BACKUP_PATH|sort -rn");
-    for my $date(split(/\n/,$date_string)){
-        my $done_file = $MASTER_BACKUP_PATH.$date."/".$BACKUP_DONE_FILE_NAME;
-        if(!-f $done_file ||$date > $DATE_TO || $date < $DATE_FROM){
+sub getLastBackupStatFromFile{
+    my %last_stat_map = ();
+    my $time_string = readpipe("ls -1L $MASTER_BACKUP_PATH|sort -rn");
+    for my $time(split(/\n/,$time_string)){
+        my $stat_file = $MASTER_BACKUP_PATH.$time."/".$LAST_STAT_FILE_NAME;
+        if(!-f $stat_file ||$time > $TIME_TO || $time < $TIME_FROM){
             next;
         }
-        for my $row(readLineFromFile($done_file)){
-            my ($base64_name,$full_name) = split(/;/,$row,2);
+        for my $row(readLineFromFile($stat_file)){
+            my ($base64_name,$full_name) = split(/;/,$row,3);
             my ($dbname,$table) = split(/\./,$full_name,2);
             if($dbname ne $BACKUP_DB){
                 next;
             }
-            if(!exists $last_done_map{$table}){
-                $last_done_map{$table} = $date;
+            if(!exists $last_stat_map{$table}){
+                $last_stat_map{$table} = $time;
             }
         }
     }
-    return %last_done_map;
+    return %last_stat_map;
 }
 sub getIndexInfo{
     my @all_index_info_list = queryResult($GET_INDEX_INFO_LIST_SQL);
@@ -789,8 +789,8 @@ sub checkTableIndex{
         }
     }
 }
-sub processLastBackupDone{
-    my %last_backup_done_from_file = getLastBackupDoneFromFile();
+sub processLastBackupStat{
+    my %last_backup_stat_from_file = getLastBackupStatFromFile();
     getIndexInfo();
     my @index_create_list = ();
     my @index_drop_list = ();
@@ -798,9 +798,9 @@ sub processLastBackupDone{
     for my $row(@TABLE_ARRAY){
         my ($scma,$rel,$where) = @$row;
         my $table = $scma.".".$rel;
-        if(exists $last_backup_done_from_file{$table}){
-            my $path_date = $last_backup_done_from_file{$table};
-            push @temp_table_array,[$scma,$rel,$where,$path_date];
+        if(exists $last_backup_stat_from_file{$table}){
+            my $path_time = $last_backup_stat_from_file{$table};
+            push @temp_table_array,[$scma,$rel,$where,$path_time];
             checkTableIndex($scma,$rel);
         }else{
             logMessage("WARN","No backup record found with table name: $table");
@@ -853,7 +853,7 @@ sub executeRestore{
     my $task = $TASK_QUEUE->dequeue();
     my $truncate_info = $NEED_TRUNCATE ? " with truncate" : "";
     while(defined $task){
-        my ($scma,$rel,$where,$date) = @$task;
+        my ($scma,$rel,$where,$time) = @$task;
         my $table = $scma.".".$rel;
         my $full_name = $DATABASE_NAME.".".$table;
         my $back_tbnm = $BACKUP_DB.".".$table;
@@ -862,7 +862,7 @@ sub executeRestore{
         $where = "" eq $where ? $GLOBAL_CONDITION : " where ".$where;
         my $query = qq{drop external table if exists $ext_table;\n};
         $query = $query.qq{create external web table $ext_table(like "$scma"."$rel")\n};
-        $query = $query."execute E'sh /tmp/fifo/gpdbrestorecat.sh $backup_path $date \$GP_SEG_PORT $back_tbnm $self_path' on ALL format 'text' encoding '$ENCODING';\n";
+        $query = $query."execute E'sh /tmp/fifo/gpdbrestorecat.sh $backup_path $time \$GP_SEG_PORT $back_tbnm $self_path' on ALL format 'text' encoding '$ENCODING';\n";
         if($NEED_TRUNCATE){
             $query = $query.qq{truncate table "$scma"."$rel";\n};
         }
@@ -874,7 +874,7 @@ sub executeRestore{
         my $duration = time() - $start;
         if($code eq 0){
             for my $row(split(/\n/,$value)){if($row =~ /^INSERT/){$value = (split(/ /,$row))[2];}}
-            @stat_msg = ("SUCCESS"," ROWS: $value TIME: $duration S DATE: $date",$full_name);
+            @stat_msg = ("SUCCESS"," ROWS: $value TIME: $duration S TIME: $time",$full_name);
         }else{
             @stat_msg = ("FAILED"," ".$value,$full_name);
         }
@@ -963,7 +963,7 @@ sub main{
     createCleverCommand();
     restoreDdl();
     processTableArray();
-    processLastBackupDone();
+    processLastBackupStat();
     processIndexDropAndLog();
     checkRestoreSchema();
     my $error_count = startRestore();
