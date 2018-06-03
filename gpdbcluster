@@ -1,0 +1,339 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use POSIX;
+
+my ($ROLE_MASTER,$ROLE_STANDBY,$ROLE_STATE) = ("Master",'Standby',"Unknow");
+my ($STANDBY_HAS,$STANDBY_NO,$STANDBY_STATE) = ("Configued","Unconfigued","Unknow");
+my ($SYNC_OK,$SYNC_ERROR,$SYNC_STATE) = ("Sync","Unsync","Unknow");
+my ($MASTER_OK,$MASTER_ERROR,$MASTER_STATE) = ("Normal","Error","Unknow");
+my ($SQL_TIMEOUT,$COMMAND_TIMEOUT,$CHECK_INTERVAL) = (5,5,20);
+my ($MASTER_HOST,$STANDBY_HOST,$MASTER_DATA_DIRECTORY,$PGPORT,$VIRTUAL_IP,$VERBOSE,$IS_HELP);
+
+my ($LOG_FILE_DATE,$LOG_FILE_HANDLE);
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+my $MAIN_PID = substr("000000".$$,-6);
+
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+Auto switch master and standby role.
+
+Developed by Miao Chen
+
+Work Email:
+michen\@pivotal.io
+Private Email:
+miaochen\@mail.ustc.edu.cn
+
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+gpdbcluster [-m master host]
+    [-s standby host]
+    [-d master data directory]
+    [-p master port]
+    [--vip virtual ip address]
+    [-h|--help]
+*****************************************************
+DESCRIPTION
+*****************************************************
+The $CMD_NAME utility is used to auto switch role between master and standby.
+You can execute some test before run in production environment.
+
+When you run it in production environment, you should submit it to backend.
+
+Command will log message to log file on path /home/gpadmin/gpAdminLogs/gpdbcluster_{DATE_FLAG}.log.
+*****************************************************
+OPTIONS
+*****************************************************
+
+-m <master hostname>
+
+  Master hostname, If not specified, command will get it from current environment.
+  eg.:
+  -s smdw
+
+-s <standby hostname>
+
+  Standby hostname, If not specified, command will get it from current environment.
+  eg.:
+  -s smdw
+
+-d <master data directory>
+
+  Database master data directory, If not specified, command will get it from current environment.
+  eg.:
+  -d /data/master/gpseg-1
+
+-p <master port>
+
+  Database port number, If not specified, command will get it from current environment.
+  eg.:
+  -p 5433
+
+--vip <virtual ip address>
+
+  You should specify it as format:
+  IP:MASK:DEV
+  eg.:
+  192.168.1.254:24:eth0
+
+-v (verbose output)
+
+  Displays detailed status, progress and error messages output by the utility.
+
+-h|--help
+  Displays the online help.
+
+Examples:
+gpdbcluster -m mdw -s GPSource -d /data/greenplum/master/gpseg-1 -p 5432 --vip '192.168.88.123:24:eth0' -v
+nohup gpdbcluster --vip '192.168.88.123:24:eth0' -v > /dev/null 2>&1 &
+#;
+
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+sub printMessage{
+    my ($flag,$message) = @_;
+    my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime).$MAIN_PID;
+    $message = "$time_flag-[$flag]-:$message\n";
+    if("ERROR" eq $flag){
+        print STDERR $message;
+    }else{
+        print STDOUT $message;
+    }
+    return $message;
+}
+sub logMessage{
+    my ($flag,$message) = @_;
+    my $log_message = printMessage($flag,$message);
+    my $log_file_date = strftime("%Y%m%d",localtime);
+    if($log_file_date ne $LOG_FILE_DATE){
+        if($LOG_FILE_HANDLE != ""){
+            close($LOG_FILE_HANDLE);
+        }
+        $LOG_FILE_DATE = $log_file_date;
+        open($LOG_FILE_HANDLE,">>","/home/gpadmin/gpAdminLogs/gpdbcluster_$LOG_FILE_DATE.log");
+    }
+    print $LOG_FILE_HANDLE $log_message;
+}
+sub errorMessage{
+    my ($message) = @_;
+    logMessage("ERROR",$message);
+    print "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exit 1;
+}
+sub getOption{
+    GetOptions(
+        'm:s'     => \$MASTER_HOST,
+        's:s'     => \$STANDBY_HOST,
+        'd:s'     => \$MASTER_DATA_DIRECTORY,
+        'p:i'     => \$PGPORT,
+        'vip:s'   => \$VIRTUAL_IP,
+        'v!'      => \$VERBOSE,
+        'h|help!' => \$IS_HELP,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exit 0;
+    }
+}
+sub setVirtualIP{
+    my ($vip,$vmask,$vdev) = split(/:/,$VIRTUAL_IP);
+    if($ROLE_STATE eq $ROLE_MASTER && $VIRTUAL_IP ne ""){
+        logMessage("INFO","Try to add virtual ipaddress: ip addr add $vip/$vmask dev $vdev");
+        system(qq{ip addr add $vip/$vmask dev $vdev});
+    }elsif($ROLE_STATE eq $ROLE_STANDBY && $VIRTUAL_IP ne ""){
+        my $output = trim(readpipe(qq(ip a|grep -w $vip|sed s'./. .'|awk '{print \$2":"\$3":"\$6}')));
+        if($output ne ""){
+            my ($curr_ip,$curr_mask,$curr_dev) = split(/:/,$output);
+            logMessage("INFO","Try to delete virtual ipaddress: ip addr del $curr_ip/$curr_mask dev $curr_dev");
+            system(qq{ip addr del $curr_ip/$curr_mask dev $curr_dev});
+        }
+    }
+}
+sub firstCheck{
+    my $output = trim(readpipe(qq{cat /etc/sudoers|grep 'Defaults.*requiretty'}));
+    if($output ne "" && !($output =~ /^#/)){
+        errorMessage("You should modify the /etc/sudoers file to disable require tty like:\n#Defaults    requiretty");
+    }
+    $output = trim(readpipe(qq{timeout -s 9 $SQL_TIMEOUT sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql template1 -tqAX -c 'select 0' 2>&1"}));
+    my $exit_code = $? >> 8;
+    if($exit_code ==0){
+        logMessage("INFO","Current host is Master");
+        $ROLE_STATE = $ROLE_MASTER;
+    }else{
+        if($output =~ /psql: FATAL:.+starting/){
+            logMessage("INFO","Current host is Standby");
+            $ROLE_STATE = $ROLE_STANDBY;
+        }else{
+            errorMessage("Try to access master occur error, exit:\n".$output);
+        }
+    }
+    if($ROLE_STATE eq $ROLE_MASTER){
+        $output = readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql template1 -tqAX <<EOF
+SHOW data_directory;
+SHOW port;
+SELECT hostname from gp_segment_configuration where content=-1 and role='p';
+SELECT hostname from gp_segment_configuration where content=-1 and role='m';
+EOF"});
+        my ($master_data_directory,$pgport,$master_host,$standby_host) = split(/\n/,$output);
+        logMessage("INFO","Information from cluster :: master_host: $master_host, standby_host: $standby_host, master_data_directory: $master_data_directory, master_port: $pgport");
+        $MASTER_HOST = $MASTER_HOST eq "" ? $master_host : $MASTER_HOST;
+        $STANDBY_HOST = $STANDBY_HOST eq "" ? $standby_host : $STANDBY_HOST;
+        $MASTER_DATA_DIRECTORY = $MASTER_DATA_DIRECTORY eq "" ? $master_data_directory : $MASTER_DATA_DIRECTORY;
+        $PGPORT = $PGPORT eq "" ? $pgport : $PGPORT;
+        logMessage("INFO","Information used :: master_host: $MASTER_HOST, standby_host: $STANDBY_HOST, master_data_directory: $MASTER_DATA_DIRECTORY, master_port: $PGPORT");
+    }
+    if($MASTER_HOST eq "" || $MASTER_DATA_DIRECTORY eq "" || $PGPORT eq ""){
+        errorMessage("Failed to start cluster for some parameter is blank :: master_host: $MASTER_HOST, master_data_directory: $MASTER_DATA_DIRECTORY, master_port: $PGPORT");
+    }
+    if($STANDBY_HOST eq ""){
+        $STANDBY_STATE = $STANDBY_NO;
+        logMessage("WARN","No standby configued");
+    }
+    setVirtualIP();
+}
+sub checkLMasterRStandby{
+    my $output = trim(readpipe(qq{timeout -s 9 $SQL_TIMEOUT sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql template1 -tqAX -c 'select 0' >/dev/null 2>&1"}));
+    my $exit_code = $? >> 8;
+    if($exit_code == 0){
+        $MASTER_STATE = $MASTER_OK;
+        if($VERBOSE){
+            logMessage("INFO","Local Master status OK");
+        }
+    }else{
+        $MASTER_STATE = $MASTER_ERROR;
+        logMessage("WARN","Local Master status error:\n".$output);
+    }
+    my $rync_state = trim(readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpstate -f|grep 'Sync state: sync'|wc -l"}));
+    if($rync_state eq "1"){
+        if($STANDBY_STATE ne $STANDBY_HAS){
+            $output = readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql template1 -tqAX <<EOF
+SELECT hostname from gp_segment_configuration where content=-1 and role='m';
+EOF"});
+            $STANDBY_HOST = trim($output);
+            initStandby();
+        }
+    }else{
+        $SYNC_STATE = $SYNC_ERROR;
+    }
+}
+sub checkLStandbyRMaster{
+    my $output = trim(readpipe(qq{timeout -s 9 $SQL_TIMEOUT sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql -h $MASTER_HOST template1 -tqAX -c 'select 0' >/dev/null 2>&1"}));
+    my $exit_code = $? >> 8;
+    if($exit_code == 0){
+        $MASTER_STATE = $MASTER_OK;
+        if($VERBOSE){
+            logMessage("INFO","Remote Master status OK");
+        }
+    }else{
+        $MASTER_STATE = $MASTER_ERROR;
+        logMessage("WARN","Remote Master status error:\n".$output);
+    }
+}
+sub stopMaster{
+    my $output = trim(readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpstop -amf"}));
+    my $exit_code = $? >> 8;
+    if($exit_code == 0){
+        logMessage("INFO","Stop Master success");
+    }else{
+        logMessage("WARN","Stop Master failed:\n$output");
+    }
+    $ROLE_STATE = $ROLE_STANDBY;
+    setVirtualIP();
+    exit 0;
+}
+sub resyncStandby{
+    if($STANDBY_STATE eq $STANDBY_NO){
+        return;
+    }
+    my $rync_state = 0;
+    for my $times(1 .. 3){
+        system(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpinitstandby -a -n"});
+        my $rync_state = trim(readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpstate -f|grep 'Sync state: sync'|wc -l"}));
+        if($rync_state eq "1"){
+            $SYNC_STATE = $SYNC_OK;
+            last;
+        }else{
+            $SYNC_STATE = $SYNC_ERROR;
+        }
+        sleep 3;
+    }
+    if($SYNC_STATE eq $SYNC_ERROR){
+        system(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpinitstandby -a -r"});
+        system(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;gpinitstandby -a -s smdw"});
+    }
+}
+sub activeStandby{
+    for my $times(1 .. 3){
+        my $output = readpipe(qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;export PGPORT=$PGPORT;gpactivatestandby -a -d $MASTER_DATA_DIRECTORY"});
+        if($VERBOSE){
+            logMessage("INFO",qq{sudo -u gpadmin sh -c "cd;. ~/.bashrc;export PGPORT=$PGPORT;gpactivatestandby -a -d $MASTER_DATA_DIRECTORY"});
+        }
+        my $exit_code = $? >> 8;
+        if($exit_code != 0){
+            logMessage("WARN","Active standby occur error:\n".$output);
+            next;
+        }
+        system(qq{timeout -s 9 $SQL_TIMEOUT sudo -u gpadmin sh -c "cd;. ~/.bashrc;psql template1 -tqAX -c 'select 0' >/dev/null 2>&1"});
+        $exit_code = $? >> 8;
+        if($exit_code == 0){
+            $ROLE_STATE = $ROLE_MASTER;
+            my $old_master_host = $MASTER_HOST;$MASTER_HOST = $STANDBY_HOST;$STANDBY_HOST = $old_master_host;
+            $STANDBY_STATE = $STANDBY_NO;
+            setVirtualIP();
+            last;
+        }
+        sleep 3;
+    }
+}
+sub initStandby{
+    my $verbose = $VERBOSE ? "-v " : "";
+    my $output = trim(readpipe(qq{ssh $STANDBY_HOST -T "nohup gpdbcluster -m $MASTER_HOST -s $STANDBY_HOST -d $MASTER_DATA_DIRECTORY -p $PGPORT --vip '$VIRTUAL_IP' $verbose> /dev/null 2>&1 &"}));
+    if($VERBOSE){
+        logMessage("INFO",qq{ssh $STANDBY_HOST -T "nohup gpdbcluster -m $MASTER_HOST -s $STANDBY_HOST -d $MASTER_DATA_DIRECTORY -p $PGPORT --vip '$VIRTUAL_IP' $verbose> /dev/null 2>&1 &"});
+    }
+    my $exit_code = $? >> 8;
+    if($exit_code == 0){
+        logMessage("INFO","Start standby cluster command success");
+        $STANDBY_STATE = $STANDBY_HAS;
+        $SYNC_STATE = $SYNC_OK;
+    }else{
+        logMessage("WARN","Start standby cluster command failed");
+    }
+}
+sub main{
+    getOption();
+    logMessage("INFO","Run command: ".$_[0]);
+    my $username = trim(readpipe("whoami"));
+    if($username ne "root"){
+        errorMessage("You must run this command with root user");
+    }
+    firstCheck();
+    while(1){
+        if($ROLE_STATE eq $ROLE_MASTER){
+            checkLMasterRStandby();
+            if($MASTER_STATE eq $MASTER_ERROR){
+                stopMaster();
+            }elsif($SYNC_STATE eq $SYNC_ERROR){
+                resyncStandby();
+            }
+            logMessage("INFO","Current stats is :: role_state: $ROLE_STATE, master state: $MASTER_STATE, standby state: $STANDBY_STATE, sync_state: $SYNC_STATE");
+        }elsif($ROLE_STATE eq $ROLE_STANDBY){
+            checkLStandbyRMaster();
+            if($MASTER_STATE eq $MASTER_ERROR){
+                activeStandby();
+            }
+            logMessage("INFO","Current stats is :: role_state: $ROLE_STATE, master state: $MASTER_STATE");
+        }
+        sleep $CHECK_INTERVAL;
+    }
+}
+my $command_string = $0." ".join(" ",@ARGV);
+$| = 1;
+main($command_string);
