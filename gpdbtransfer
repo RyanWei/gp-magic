@@ -1,6 +1,5 @@
 #!/usr/bin/perl
 use strict;
-use Switch;
 use MIME::Base64;
 use threads;
 use Thread::Queue;
@@ -8,7 +7,7 @@ use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
 use POSIX;
 
 my ($SRC_HOST,$SRC_PORT,$SRC_USER,$SRC_PASSWD,$SRC_DATABASE,$DEST_HOST,$DEST_PORT,$DEST_USER,$DEST_PASSWD,$DEST_DATABASE,
-    $KEY,$SRC_MAPFILE,$BY_LEAF,$FORCE,$FORCE_OWNER,@TABLE_ARRAY,@EX_TABLE_ARRAY,$TABLE_FILE,$EX_TABLE_FILE,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,
+    $KEY,$SRC_MAPFILE,$BY_LEAF,$FORCE,$FORCE_OWNER,$MASTER_ONLY,@TABLE_ARRAY,@EX_TABLE_ARRAY,$TABLE_FILE,$EX_TABLE_FILE,@SCHEMA_ARRAY,@EX_SCHEMA_ARRAY,
     $INCREMENT,$NEED_DELETE,$NEED_TRUNCATE,$NEED_ANALYZE,$ENCODING,$BATCH_SIZE,$GLOBAL_CONDITION,$LOG_PATH,$PARAMETER_FILE,$IS_HELP);
 my (%SRC_HOSTMAP,$SRC_GPHOME,$DEST_GPHOME,$TASK_QUEUE,$MSG_QUEUE,$LOG_FILE_HANDLE);
 my ($BATCH_MAX,$BATCH_DEFAULT,$BATCH_MIN,$SQL_BATCH) = (20,6,1,300);
@@ -287,6 +286,7 @@ $CMD_NAME --src-host hostname
     [--by-leaf]
     [--force]
     [--owner owner]
+    [--from-master]
     [-t <schema.relation> [-t <schema.relation>] ...]
     [-T <schema.relation> [-T <schema.relation>] ...]
     [-f file include table name]
@@ -435,6 +435,11 @@ OPTIONS
 --owner
 
   Specify this option to set owner -- when use --force option and recreate dest table when needed.
+
+--from-master
+
+  Specify this option to use only master to master data transfer path from some network restrict.
+  For example, network accessible only between master with master.
 
 -t <schema.tablename>
 
@@ -668,14 +673,15 @@ sub queryResult{
 }
 sub getOption{
     GetOptions(
-        'src-host:s'  => \$SRC_HOST,     'src-port:i'    => \$SRC_PORT,         'src-user:s'  => \$SRC_USER,     'src-passwd:s'      => \$SRC_PASSWD,     'src-database:s'  => \$SRC_DATABASE,
-        'dest-host:s' => \$DEST_HOST,    'dest-port:i'   => \$DEST_PORT,        'dest-user:s' => \$DEST_USER,    'dest-passwd:s'     => \$DEST_PASSWD,    'dest-database:s' => \$DEST_DATABASE,
-        'key:i'       => \$KEY,          'src-mapfile:s' => \$SRC_MAPFILE,      'by-leaf!'    => \$BY_LEAF,      'force!'            => \$FORCE,          'owner'           => \$FORCE_OWNER,
-        't:s'         => \@TABLE_ARRAY,  'T:s'           => \@EX_TABLE_ARRAY, 
-        'f:s'         => \$TABLE_FILE,   'F:s'           => \$EX_TABLE_FILE,
-        's:s'         => \@SCHEMA_ARRAY, 'S:s'           => \@EX_SCHEMA_ARRAY,
-        'increment!'  => \$INCREMENT,    'delete!'       => \$NEED_DELETE,      'truncate!'   => \$NEED_TRUNCATE, 'analyze!'         => \$NEED_ANALYZE,   'encoding:s'      => \$ENCODING,
-        'B:i'         => \$BATCH_SIZE,   'where:s'       => \$GLOBAL_CONDITION, 'log-path:s'  => \$LOG_PATH,      'parameter-file:s' => \$PARAMETER_FILE, 'h|help!'         => \$IS_HELP,
+        'src-host:s'   => \$SRC_HOST,     'src-port:i'    => \$SRC_PORT,         'src-user:s'  => \$SRC_USER,     'src-passwd:s'      => \$SRC_PASSWD,     'src-database:s'  => \$SRC_DATABASE,
+        'dest-host:s'  => \$DEST_HOST,    'dest-port:i'   => \$DEST_PORT,        'dest-user:s' => \$DEST_USER,    'dest-passwd:s'     => \$DEST_PASSWD,    'dest-database:s' => \$DEST_DATABASE,
+        'key:i'        => \$KEY,          'src-mapfile:s' => \$SRC_MAPFILE,      'by-leaf!'    => \$BY_LEAF,      'force!'            => \$FORCE,          'owner'           => \$FORCE_OWNER,
+        'from-master!' => \$MASTER_ONLY,
+        't:s'          => \@TABLE_ARRAY,  'T:s'           => \@EX_TABLE_ARRAY, 
+        'f:s'          => \$TABLE_FILE,   'F:s'           => \$EX_TABLE_FILE,
+        's:s'          => \@SCHEMA_ARRAY, 'S:s'           => \@EX_SCHEMA_ARRAY,
+        'increment!'   => \$INCREMENT,    'delete!'       => \$NEED_DELETE,      'truncate!'   => \$NEED_TRUNCATE, 'analyze!'         => \$NEED_ANALYZE,   'encoding:s'      => \$ENCODING,
+        'B:i'          => \$BATCH_SIZE,   'where:s'       => \$GLOBAL_CONDITION, 'log-path:s'  => \$LOG_PATH,      'parameter-file:s' => \$PARAMETER_FILE, 'h|help!'         => \$IS_HELP,
     );
     if(@ARGV != 0){
         errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
@@ -704,6 +710,7 @@ sub getOption{
             if("by-leaf"       eq $para && "" eq $BY_LEAF          ){$BY_LEAF              =1   ;}
             if("force"         eq $para && "" eq $FORCE            ){$FORCE                =1   ;}
             if("owner"         eq $para && "" eq $FORCE_OWNER      ){$FORCE_OWNER          =$val;}
+            if("from-master"   eq $para && "" eq $MASTER_ONLY      ){$MASTER_ONLY          =1   ;}
             if("t"             eq $para                            ){push @TABLE_ARRAY     ,$val;}
             if("T"             eq $para                            ){push @EX_TABLE_ARRAY  ,$val;}
             if("f"             eq $para && "" eq $TABLE_FILE       ){$TABLE_FILE           =$val;}
@@ -797,7 +804,7 @@ sub checkOption{
     $GLOBAL_CONDITION="" ne $GLOBAL_CONDITION ? " where ".$GLOBAL_CONDITION : "";
     logMessage("INFO","Option values: --src-host $SRC_HOST --src-port $SRC_PORT --src-user $SRC_USER --src-passwd $SRC_PASSWD --src-database $SRC_DATABASE");
     logMessage("INFO","Option values: --dest-host $DEST_HOST --dest-port $DEST_PORT --dest-user $DEST_USER --dest-passwd $DEST_PASSWD --dest-database $DEST_DATABASE");
-    logMessage("INFO","Option values: --key $KEY --src-mapfile $SRC_MAPFILE --by-leaf $BY_LEAF --force $FORCE --owner $FORCE_OWNER");
+    logMessage("INFO","Option values: --key $KEY --src-mapfile $SRC_MAPFILE --by-leaf $BY_LEAF --force $FORCE --owner $FORCE_OWNER --from-master $MASTER_ONLY");
     logMessage("INFO","Option values: -t ".join(' -t ',@TABLE_ARRAY)." -T ".join(' -T ',@EX_TABLE_ARRAY));
     logMessage("INFO","Option values: -f $TABLE_FILE -F $EX_TABLE_FILE");
     logMessage("INFO","Option values: -s ".join(' -s ',@SCHEMA_ARRAY)." -S ".join(' -S ',@EX_SCHEMA_ARRAY));
@@ -805,7 +812,7 @@ sub checkOption{
     logMessage("INFO","Option values: --where $GLOBAL_CONDITION --log-path $LOG_PATH --parameter-file $PARAMETER_FILE");
     for my $ref((\$SRC_USER,\$SRC_PASSWD,\$DEST_USER,\$DEST_PASSWD)){
         if(uc($$ref) =~ /^BASE64/){
-            $$ref = trim(decode_base64(substr($$ref,6)));
+            $$ref = trim(decode(substr($$ref,6)));
         }
     }
 }
@@ -1258,6 +1265,9 @@ sub checkTransferSchema{
     }
 }
 sub checkContentConsistent{
+    if($MASTER_ONLY){
+        return;
+    }
     my $checkTable = 'gpdbtransfer.transform_'.$KEY.'_0';
     queryResult("DEST","drop external table if exists $checkTable;","CV");
     my $base64_pass = encode("" eq $SRC_PASSWD ? "--" : $SRC_PASSWD);
@@ -1330,6 +1340,7 @@ sub checkTableDefinition{
         my $comment_sql = "\n";
         for my $idx(0 .. $src_column_size - 1){
             my ($column_name,$column_type,$relation_dsc,$column_dsc) = @{$src_column_array[$idx]};
+            ($relation_dsc,$column_dsc) = (decode($relation_dsc),decode($column_dsc));
             $recreate_sql = $recreate_sql.'"'.$column_name.'"'."\t".$column_type;
             $recreate_sql = $recreate_sql.($idx < $src_column_size-1 ? ",\n" : "\n");
             if($idx == 0 && "" ne $relation_dsc){$comment_sql = $comment_sql.qq{comment on table "$dest_schema"."$dest_relation" is '$relation_dsc';\n};}
@@ -1351,8 +1362,10 @@ sub getSrcTableColumn{
     my ($schema_name,$relation_name) = @_;
     my $query_sql;
     if($FORCE){
-        $query_sql = qq{select attname,format_type(atttypid,atttypmod),d1.description dsc1,d2.description dsc2 from
-        pg_namespace n join pg_class c on c.relnamespace=n.oid
+        $query_sql = qq{select attname,format_type(atttypid,atttypmod),
+        replace(encode(textsend(d1.description),'base64'),chr(10),'') dsc1,
+        replace(encode(textsend(d2.description),'base64'),chr(10),'') dsc2
+        from pg_namespace n join pg_class c on c.relnamespace=n.oid
         join pg_attribute a on c.oid=a.attrelid
         left join pg_description d1 on c.oid=d1.objoid and d1.objsubid=0
         left join pg_description d2 on c.oid=d2.objoid and a.attnum=d2.objsubid
@@ -1388,7 +1401,9 @@ sub executeTransfer{
             @stat_msg = ("FAILED",$problem);
         }else{
             my $from_master = 0;
-            if("v" eq $relkind){
+            if($MASTER_ONLY){
+                $from_master = 1;
+            }elsif("v" eq $relkind){
                 ($code,$value) = queryResult("SRC",qq{explain select * from $src_tableqq}.qq{$where;},"CV");
                 if($code > 0){
                    @stat_msg = ("FAILED","Can't get view's explain, FROM $src_table TO $dest_table [$code],[$value]");
