@@ -1,0 +1,304 @@
+#!/usr/bin/perl
+use strict;
+use MIME::Base64;
+use threads;
+use Thread::Queue;
+use Getopt::Long qw(:config bundling no_ignore_case no_autoabbrev passthrough);
+use POSIX;
+
+my ($SOURCE_DDL_FILE,$TO_ROW_FILE,$TARGET_VERSION,$TARGET_DDL_FILE,$IS_HELP);
+my (%TO_ROW_HASH,@LINE_CACHE_LIST,$CURRENT_SCHEMA);
+my ($TABLE_HANDLE,$GRANT_HANDLE,$INDEX_HANDLE,$VIEW_HANDLE,$COMMENT_HANDLE);
+my ($IN_BODY,$IN_TABLE,$IN_GRANT,$IN_INDEX,$IN_VIEW,$IN_COMMENT) = ("",1,2,3,4,6);
+(my $CMD_NAME = $0) =~ s!.*/(.*)!$1!;
+my $MAIN_PID = substr("000000".$$,-6);
+
+my $HELP_MESSAGE = qq#COMMAND NAME: $CMD_NAME
+Transform a Greenplum database DDL to a better format.
+You can chose transform column table to row.
+
+Developed by Miao Chen
+
+Work Email:
+michen\@pivotal.io
+Private Email:
+miaochen\@mail.ustc.edu.cn
+
+************************************************************************************************
+SYNOPSIS
+************************************************************************************************
+$CMD_NAME --source-ddl-file filename
+    --to-row-file filename
+    --target-version main version number
+    --target-ddl-file filename
+    -h|--help
+*****************************************************
+DESCRIPTION
+*****************************************************
+The $CMD_NAME utility is used to transform ddl format.
+
+The $CMD_NAME command will split source ddl to 5 file:
+  {target-ddl-file}.table
+  {target-ddl-file}.index
+  {target-ddl-file}.view
+  {target-ddl-file}.grant
+  {target-ddl-file}.comment
+*****************************************************
+OPTIONS
+*****************************************************
+--source-ddl-file <filename>
+
+  Original database ddl file.
+  This option is required.
+  eg.:
+  --source-ddl-file ddl.sql
+
+--to-row-file <filename>
+
+  Table list file include schema.relation which should be tranform from column to row orientation.
+  eg.
+  --to-row-file table.list
+
+--target-version <main number>
+
+  Main greenplum database version number.
+  Current support version 4 or version 5
+  Command will modify log error table when transform to version 5.
+  eg.
+  --target-version 5
+
+--target-ddl-file <filename>
+
+  Transform target file name prefix, result file will be split to 5 file:
+  {target-ddl-file}.table    include table   ddl
+  {target-ddl-file}.index    include index   ddl
+  {target-ddl-file}.view     include view    ddl
+  {target-ddl-file}.grant    include grant   ddl
+  {target-ddl-file}.comment  include comment ddl
+-h|--help
+  Displays the online help.
+
+Examples:
+$CMD_NAME --source-ddl-file ddl.sql --to-row-file table.list --target-version 5 --target-ddl-file new.ddl
+$CMD_NAME -h
+#;
+
+sub printMessage{
+    my ($flag,$message) = @_;
+    if("RAW" ne $flag){
+        my $time_flag = strftime("%Y%m%d:%H:%M:%S.",localtime).$MAIN_PID;
+        $message = "$time_flag-[$flag]-:$message\n";
+    }
+    if("ERROR" eq $flag){
+        print STDERR $message;
+    }else{
+        print STDOUT $message;
+    }
+    return $message;
+}
+sub logMessage{
+    my ($flag,$message) = @_;
+    my $log_message = printMessage($flag,$message);
+}
+sub errorMessage{
+    my ($message) = @_;
+    logMessage("ERROR",$message);
+    print "Usage: $CMD_NAME [-h|--help] [options]\n";
+    exit 1;
+}
+sub trim{
+    my ($string) = @_;
+    $string =~ s/(^\s+|\s+$)//g;
+    return $string;
+}
+
+sub getOption{
+    GetOptions(
+        'source-ddl-file:s' => \$SOURCE_DDL_FILE,
+        'to-row-file:s'     => \$TO_ROW_FILE,
+        'target-version:i'  => \$TARGET_VERSION,
+        'target-ddl-file:s' => \$TARGET_DDL_FILE,
+        'h|help!'           => \$IS_HELP,
+    );
+    if(@ARGV != 0){
+        errorMessage("Some parameters unknown: [@ARGV]\nPlease refer to $CMD_NAME --help");
+    }
+    if($IS_HELP){
+        print $HELP_MESSAGE;
+        exit 0;
+    }
+}
+sub checkOption{
+    if("" eq $SOURCE_DDL_FILE){
+        errorMessage("Please specify parameter: --source-ddl-file");
+    }elsif(!-f $SOURCE_DDL_FILE){
+        errorMessage("Parameter specify --source-ddl-file is not a file: $SOURCE_DDL_FILE");
+    }
+    if("" eq $TO_ROW_FILE){
+        logMessage("NOTICE","No column to row list file");
+    }elsif(!-f $TO_ROW_FILE){
+        errorMessage("Parameter specify --to-row-file is not a file: $TO_ROW_FILE");
+    }
+    if("" eq $TARGET_VERSION){
+        errorMessage("Please specify parameter: --target-version");
+    }elsif($TARGET_VERSION != 4 && $TARGET_VERSION != 5){
+        errorMessage("Currently only support version 4 and version 5");
+    }
+    if("" eq $TARGET_DDL_FILE){
+        errorMessage("Please specify parameter: --target-ddl-file");
+    }
+
+    logMessage("INFO","Option values: --source-ddl-file $SOURCE_DDL_FILE --to-row-file $TO_ROW_FILE --target-version $TARGET_VERSION --target-ddl-file $TARGET_DDL_FILE");
+}
+sub readToRowFile{
+    my $to_row_handle;
+    if(!open($to_row_handle,"<",$TO_ROW_FILE)){
+        errorMessage("Can't open file: $TO_ROW_FILE");
+    }
+    while(my $line = <$to_row_handle>){
+        $line = trim($line);
+        $TO_ROW_HASH{$line} = "";
+    }
+}
+sub prepareFile{
+    my $table_file   = $TARGET_DDL_FILE.".table";
+    my $grant_file   = $TARGET_DDL_FILE.".grant";
+    my $index_file   = $TARGET_DDL_FILE.".index";
+    my $view_file    = $TARGET_DDL_FILE.".view";
+    my $comment_file = $TARGET_DDL_FILE.".comment";
+    if(!open($TABLE_HANDLE,">",$table_file)){
+        errorMessage("Can't open file: $table_file");
+    }
+    if(!open($GRANT_HANDLE,">",$grant_file)){
+        errorMessage("Can't open file: $grant_file");
+    }
+    if(!open($INDEX_HANDLE,">",$index_file)){
+        errorMessage("Can't open file: $index_file");
+    }
+    if(!open($VIEW_HANDLE,">",$view_file)){
+        errorMessage("Can't open file: $view_file");
+    }
+    if(!open($COMMENT_HANDLE,">",$comment_file)){
+        errorMessage("Can't open file: $comment_file");
+    }
+}
+sub writeToFile{
+    my ($line) = (@_);
+    if($line !~ /\n$/){
+        $line = $line."\n";
+    }
+    if($IN_BODY eq $IN_GRANT){
+        print $GRANT_HANDLE $line;
+    }elsif($IN_BODY eq $IN_INDEX){
+        print $INDEX_HANDLE $line;
+    }elsif($IN_BODY eq $IN_VIEW){
+        print $VIEW_HANDLE $line;
+    }elsif($IN_BODY eq $IN_COMMENT){
+        print $COMMENT_HANDLE $line;
+    }else{
+        print $TABLE_HANDLE $line;
+    }
+}
+sub processLine{
+    my ($line) = @_;
+    if($line =~ /^SET /){
+        $IN_BODY = $IN_INDEX;writeToFile($line);
+        $IN_BODY = $IN_VIEW;writeToFile($line);
+        $IN_BODY = $IN_COMMENT;writeToFile($line);
+        $IN_BODY = "";
+        if($line =~ /^SET search_path =/){
+            $CURRENT_SCHEMA = trim((split(/,/,(split(/=/,$line))[1]))[0]);
+        }
+    }
+    if($line =~ /^CREATE TABLE /){
+        my $relation = (split(/ /,trim($line)))[2];
+        my $table = $CURRENT_SCHEMA.".".$relation;
+        if(exists $TO_ROW_HASH{$table}){
+            $IN_BODY = $IN_TABLE;
+        }
+    }elsif($line =~ /^GRANT /){
+        $IN_BODY = $IN_GRANT;
+    }elsif($line =~ /^CREATE INDEX /){
+        $IN_BODY = $IN_INDEX;
+    }elsif($line =~ /^CREATE VIEW /){
+        $IN_BODY = $IN_VIEW;
+    }elsif($line =~ /^COMMENT ON /){
+        $IN_BODY = $IN_COMMENT;
+    }
+    if($IN_BODY eq ""){
+        if($TARGET_VERSION == 5){
+            if($line =~ /^LOG ERRORS INTO /){
+                $line =~ s/ INTO .+ SEGMENT/ SEGMENT/;
+            }
+        }
+        writeToFile($line);
+    }else{
+        push @LINE_CACHE_LIST,$line;
+        if(($IN_BODY ne $IN_COMMENT && trim($line) =~ /;$/) || ($IN_BODY eq $IN_COMMENT && trim($line) =~ /';$/)){
+            for my $new_line(@LINE_CACHE_LIST){
+                my $line_trim = trim($new_line);
+                if($line_trim =~ /^COLUMN.+ENCODING /){
+                    if($line_trim =~ /,$/){
+                        $new_line = ",";
+                    }else{
+                        next;
+                    }
+                }elsif($line_trim =~ / ENCODING.+\(.+\)/){
+                    $new_line =~ s/ ENCODING.+\(.+\)//;
+                }elsif($line_trim =~ /orientation=column/){
+                    $new_line =~ s/orientation=column/orientation=row/;
+                }
+                writeToFile($new_line);
+            }
+            @LINE_CACHE_LIST = ();
+            $IN_BODY = "";
+        }
+    }
+}
+sub progressBar{
+    my ($length,$total,$index) = @_;
+    my $percent = int($index * 100 / $total);
+    $percent = substr("  ".$percent, -3);
+    my $pass = int($index * $length / $total);
+    my $last = $length - $pass;
+    my $progress = $index == $total ? " " : ('-','\\','|','/')[$index % 4];
+    my $bar = "[ ".(">" x $pass).(" " x $last).$progress.$percent." % ]";
+    print STDOUT "\r\r".$bar;
+}
+sub startTransform{
+    my $source_handle;
+    my $total = trim(readpipe(qq{wc -l $SOURCE_DDL_FILE}));
+    if(!open($source_handle,"<",$SOURCE_DDL_FILE)){
+        errorMessage("Can't open file: $SOURCE_DDL_FILE");
+    }
+    my ($index,$last_ratio,$current_ratio) = (0,0.0,0.0);
+    while(my $line = <$source_handle>){
+        processLine($line);
+        $index ++;
+        $current_ratio = int($index * 100 / $total);
+        if($current_ratio != $last_ratio){
+            progressBar(100,100,$current_ratio);
+            $last_ratio = $current_ratio;
+        }
+    }
+    print "\n";
+}
+sub closeFile{
+    close $TABLE_HANDLE;
+    close $INDEX_HANDLE;
+    close $VIEW_HANDLE;
+    close $COMMENT_HANDLE;
+}
+sub main{
+    getOption();
+    logMessage("INFO","Start backup process".("." x 66));
+    logMessage("INFO","Run command: ".$_[0]);
+    checkOption();
+    readToRowFile();
+    prepareFile();
+    startTransform();
+    closeFile();
+}
+my $command_string = $0." ".join(" ",@ARGV);
+$| = 1;
+main($command_string);
