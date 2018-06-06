@@ -836,7 +836,7 @@ sub getMergeCommand{
     if(!open($FILE_HANDLE,">",$merge_stat_file)){
         errorMessage("Can't open file: $merge_stat_file");
     }
-    print $FILE_HANDLE join("\n",@stat_list);
+    print $FILE_HANDLE join("\n",@stat_list)."\n";
     close $FILE_HANDLE;
     for my $time(@$valid_time_list){
         if($time < $merge_time){
