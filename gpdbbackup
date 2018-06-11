@@ -302,9 +302,8 @@ OPTIONS
 
 --database <database>
 
-  Backup table in this database.
-  This option is required.
-  If you not specify -t and -f options, all user tables in this database will be backup.
+  Specify the database name to be backed up. --This is mandatory option.
+  If -t or -f option not specified, all user tables in this database will be backed up.
   eg.:
   --database postgres
 
